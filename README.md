@@ -6,6 +6,10 @@ ESPHome firmware for a Tuya-based automatic pet feeder, replacing the original W
 
 ## Hardware
 
+### Feeder Control Board
+
+The feeder's main control board carries the marking **A90_YP_2301WIFI_V1.0_W**. Throughout this firmware and the Tuya serial protocol documentation, this board is referred to as the **MCU** — this is standard Tuya terminology for the non-Wi-Fi side of the protocol (as opposed to the "Wi-Fi module" side). In practice it is the feeder's dedicated controller handling the motor, sensors, buttons, and LED indicators.
+
 The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3 Super Mini soldered to the same pads.
 
 | WBR3 Pad | ESP32-C3 | Direction | Function |
