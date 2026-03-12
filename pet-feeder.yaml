@@ -1,6 +1,10 @@
+# ── DEBUG FLAG ────────────────────────────────────────────────────────────────
+# Set mqtt_debug to "true" to publish debug messages to wifi2mqtt/pet-feeder/debug
+# Set to "false" for normal operation to avoid MQTT spam
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
+  mqtt_debug: "false"   # ← change to "true" to enable MQTT debug messages
 
 esphome:
   name: ${device_name}
@@ -48,16 +52,16 @@ mqtt:
     retain: true
   on_connect:
     then:
-      # Signal MCU that WiFi module is ready — MCU will start sending heartbeats
+      # Drive EN pin high — signals MCU that WiFi module is ready
       - output.turn_on: mcu_en_pin
       - mqtt.publish:
           topic: ${topic_prefix}/availability
           payload: "online"
           retain: true
-      - mqtt.publish:
-          topic: ${topic_prefix}/status
-          payload: "Idle"
-          retain: true
+      # Publish initial sensor states
+      - lambda: id(feeder_sensor).publish_state("Idle");
+      - lambda: id(mcu_sensor).publish_state("Disconnected");
+      - lambda: id(lock_sensor).publish_state("Unlocked");
       - script.execute: do_handshake
   on_disconnect:
     then:
@@ -70,13 +74,22 @@ mqtt:
             id: feed_script
             portions: !lambda "return atoi(x.c_str());"
 
-# ── PIN ASSIGNMENTS (ESP32-C3 Super Mini) ────────────────────────────────────
-#  WBR3 pad   → C3 GPIO  Function
-#  Pin 8 VCC  → 3V3      Power
-#  Pin 9 GND  → GND      Ground
-#  Pin16 TXD  → GPIO20   UART RX (ESP receives MCU TX)
-#  Pin15 RXD  → GPIO21   UART TX (ESP sends to MCU RX)
-#  Pin EN     → GPIO2    WiFi module ready signal (driven high after handshake)
+# ── PIN ASSIGNMENTS (ESP32-C3 Super Mini → WBR3 footprint) ──────────────────
+#
+#  WBR3 pad   ESP32-C3    Direction   Function
+#  ─────────  ─────────   ─────────   ────────────────────────────────────────
+#  Pin  8     3V3         PWR         VCC — power supply
+#  Pin  9     GND         PWR         Ground
+#  Pin 15     GPIO21      ESP → MCU   UART TX  (WBR3 RXD — data to MCU)
+#  Pin 16     GPIO20      MCU → ESP   UART RX  (WBR3 TXD — data from MCU)
+#  Pin EN     GPIO10      ESP → MCU   Module ready signal
+#                                     LOW at boot, HIGH after WiFi+MQTT connect
+#                                     MCU waits for this before starting handshake
+#
+#  Notes:
+#  - GPIO10 has no strapping pin restrictions on ESP32-C3 (safe for output use)
+#  - GPIO20/21 are the recommended UART0 pins for ESP32-C3 with esp-idf
+#  - All signals are 3.3V — no level shifting required
 # ─────────────────────────────────────────────────────────────────────────────
 
 uart:
@@ -90,7 +103,7 @@ output:
   - platform: gpio
     id: mcu_en_pin
     pin:
-      number: GPIO2
+      number: GPIO10
       mode:
         output: true
 
@@ -166,6 +179,40 @@ text_sensor:
               topic: ${topic_prefix}/ip
               payload: !lambda "return x;"
 
+  - platform: template
+    name: "Feeder Status"
+    id: feeder_sensor
+    icon: "mdi:bowl"
+    on_value:
+      then:
+        - mqtt.publish:
+            topic: ${topic_prefix}/feeder
+            payload: !lambda "return x;"
+            retain: true
+
+  - platform: template
+    name: "MCU Status"
+    id: mcu_sensor
+    icon: "mdi:chip"
+    entity_category: diagnostic
+    on_value:
+      then:
+        - mqtt.publish:
+            topic: ${topic_prefix}/mcu
+            payload: !lambda "return x;"
+            retain: true
+
+  - platform: template
+    name: "Lock Status"
+    id: lock_sensor
+    icon: "mdi:lock"
+    on_value:
+      then:
+        - mqtt.publish:
+            topic: ${topic_prefix}/lock
+            payload: !lambda "return x;"
+            retain: true
+
 script:
   # ── Tuya handshake ────────────────────────────────────────────────────────
   # Sequence confirmed from WBR3 startup capture.
@@ -185,11 +232,9 @@ script:
       - delay: 200ms
       - uart.write: [0x55, 0xAA, 0x00, 0x08, 0x00, 0x00, 0x07]       # CMD 0x08
       - delay: 500ms
-      - lambda: "id(mcu_connected) = true;"
-      - mqtt.publish:
-          topic: ${topic_prefix}/mcu_status
-          payload: "Connected"
-          retain: true
+      - lambda: |-
+          id(mcu_connected) = true;
+          id(mcu_sensor).publish_state("Connected");
       - logger.log: "Handshake complete"
 
   # ── Feed script ───────────────────────────────────────────────────────────
@@ -201,10 +246,7 @@ script:
       portions: int
     mode: single
     then:
-      - mqtt.publish:
-          topic: ${topic_prefix}/status
-          payload: "Feeding"
-          retain: true
+      - lambda: id(feeder_sensor).publish_state("Feeding");
       - lambda: |-
           int n = portions;
           if (n < 1) n = 1;
@@ -219,18 +261,26 @@ script:
           id(tuya_uart).write_array(frame, sizeof(frame));
           id(feeding_active) = true;
           ESP_LOGI("tuya", "Feed frame sent: %d portions checksum=0x%02X", n, checksum);
-      # Feeding done is detected in RX poll. 30s hard timeout.
-      - delay: 30s
+          if ("${mqtt_debug}" == std::string("true")) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Feed sent: %d portions checksum=0x%02X", n, checksum);
+            mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+          }
+      # Wait for RX poll to clear feeding_active. Exits immediately when done.
+      - wait_until:
+          condition:
+            lambda: "return !id(feeding_active);"
+          timeout: 30s
       - if:
           condition:
             lambda: "return id(feeding_active);"
           then:
-            - lambda: "id(feeding_active) = false;"
-            - mqtt.publish:
-                topic: ${topic_prefix}/status
-                payload: "Error"
-                retain: true
+            - lambda: |-
+                id(feeding_active) = false;
+                id(feeder_sensor).publish_state("Error");
             - logger.log: "Feed timeout — no done signal received from MCU"
+          else:
+            - lambda: id(feeder_sensor).publish_state("Idle");
 
 interval:
   - interval: 30s
@@ -254,12 +304,15 @@ interval:
   # We always reply with v0 frames (55 AA 00 ...) — MCU accepts this.
   #
   # Key frames from capture:
-  #   CMD 0x00 — heartbeat (reply with 55 AA 00 00 00 00 FF)
-  #   CMD 0x01 — product info (MCU sends its ID string, no reply needed)
+  #   CMD 0x00 — heartbeat       (reply with 55 AA 00 00 00 00 FF)
+  #   CMD 0x01 — product info    (MCU sends its ID string, no reply needed)
+  #   CMD 0x02 — MCU state       (current DP dump, no reply needed)
   #   CMD 0x07 — DP status report
-  #     DP4  (0x04): 0x00=idle/done, 0x02=feeding
+  #     DP4  (0x04): 0x00=idle/done, 0x01=scheduled, 0x02=feeding
   #     DP25 (0x19): 0x00=unlocked, 0x01=locked
-  #   CMD 0x34 — extended feeding log (contains DP11 record)
+  #   CMD 0x08 — MCU ack to our CMD 0x08 (no action needed)
+  #   CMD 0x1C — time sync ack   (no action needed)
+  #   CMD 0x34 — extended feeding log (contains DP11 record with timestamp)
   - interval: 100ms
     then:
       - lambda: |-
@@ -289,7 +342,7 @@ interval:
               id(tuya_uart).write_array(hb, sizeof(hb));
               if (!id(mcu_heartbeat_seen)) {
                 id(mcu_heartbeat_seen) = true;
-                ESP_LOGD("tuya", "First heartbeat seen");
+                ESP_LOGV("tuya", "First heartbeat seen");
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
@@ -297,6 +350,8 @@ interval:
 
             // ── CMD 0x01 Product info from MCU ──────────────────────────
             if (cmd == 0x01) {
+              if ("${mqtt_debug}" == std::string("true"))
+                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", "CMD01 product info received", 0, false);
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
@@ -304,6 +359,8 @@ interval:
 
             // ── CMD 0x02 MCU state report ────────────────────────────────
             if (cmd == 0x02) {
+              if ("${mqtt_debug}" == std::string("true"))
+                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", "CMD02 MCU state report", 0, false);
               ESP_LOGD("tuya", "CMD02 MCU state report");
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
@@ -312,19 +369,21 @@ interval:
             // ── CMD 0x07 DP status report ────────────────────────────────
             // Payload: [dp_id][dp_type][val_len_hi][val_len_lo][val...]
             if (cmd == 0x07 && payload_len >= 5 && buf.size() >= 7u + payload_len) {
-              uint8_t dp_id   = buf[6];
-              uint8_t dp_type = buf[7];
-              uint16_t val_len = (buf[8] << 8) | buf[9];
-              uint8_t dp_val  = buf[10];  // first/only value byte for bool/enum
+              uint8_t dp_id    = buf[6];
+              uint8_t dp_type  = buf[7];
+              uint8_t dp_val   = buf[10];  // first value byte (bool/enum)
 
+              if ("${mqtt_debug}" == std::string("true")) {
+                char msg[64];
+                snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
+                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+              }
               ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
 
-              // DP4 (0x04) = feeding motor state
-              // 0x00 = idle/done, 0x01 = scheduled, 0x02 = feeding
+              // DP4 (0x04) = feeding motor state: 0x00=idle/done
               if (dp_id == 0x04 && dp_val == 0x00 && id(feeding_active)) {
                 id(feeding_active) = false;
-                auto &mqtt = *mqtt::global_mqtt_client;
-                mqtt.publish("${topic_prefix}/status", "Idle", 0, true);
+                id(feeder_sensor).publish_state("Idle");
                 ESP_LOGI("tuya", "Feeding done — DP4=0");
               }
 
@@ -332,8 +391,7 @@ interval:
               if (dp_id == 0x19) {
                 bool locked = (dp_val == 0x01);
                 id(feeder_locked) = locked;
-                auto &mqtt = *mqtt::global_mqtt_client;
-                mqtt.publish("${topic_prefix}/locked", locked ? "ON" : "OFF", 0, true);
+                id(lock_sensor).publish_state(locked ? "Locked" : "Unlocked");
                 ESP_LOGI("tuya", "Lock: %s", locked ? "LOCKED" : "UNLOCKED");
               }
 
@@ -341,23 +399,45 @@ interval:
               continue;
             }
 
+            // ── CMD 0x08 MCU ack ─────────────────────────────────────────
+            if (cmd == 0x08) {
+              ESP_LOGV("tuya", "CMD08 ack from MCU");
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // ── CMD 0x1C Time sync ack ───────────────────────────────────
+            if (cmd == 0x1C) {
+              ESP_LOGV("tuya", "CMD1C time sync ack");
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
             // ── CMD 0x34 Extended feeding log ────────────────────────────
             // Sent after feed completes. Contains DP11 record with timestamp.
-            // Use as fallback feeding-done signal.
             if (cmd == 0x34 && payload_len >= 2) {
               uint8_t dp_id = buf[6];
+              if ("${mqtt_debug}" == std::string("true")) {
+                char msg[48];
+                snprintf(msg, sizeof(msg), "CMD34 DP%d extended report", dp_id);
+                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+              }
               ESP_LOGI("tuya", "CMD34 DP%d extended report", dp_id);
               if (dp_id == 0x0B && id(feeding_active)) {
                 id(feeding_active) = false;
-                auto &mqtt = *mqtt::global_mqtt_client;
-                mqtt.publish("${topic_prefix}/status", "Idle", 0, true);
+                id(feeder_sensor).publish_state("Idle");
                 ESP_LOGI("tuya", "Feeding done — CMD34 DP11");
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
 
-            // Unknown — log and discard
+            // ── Unknown ──────────────────────────────────────────────────
+            if ("${mqtt_debug}" == std::string("true")) {
+              char msg[48];
+              snprintf(msg, sizeof(msg), "Unknown CMD 0x%02X len=%d", cmd, payload_len);
+              mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+            }
             ESP_LOGW("tuya", "Unknown CMD 0x%02X len=%d", cmd, payload_len);
             buf.erase(buf.begin(), buf.begin() + full_len);
           }
