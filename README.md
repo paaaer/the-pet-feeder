@@ -15,7 +15,7 @@ This is an [ESPHome](https://esphome.io/) project — ESPHome is a system for pr
 
 The feeder's main control board carries the marking **A90_YP_2301WIFI_V1.0_W**. Throughout this firmware and the Tuya serial protocol documentation, this board is referred to as the **MCU** — this is standard Tuya terminology for the non-Wi-Fi side of the protocol (as opposed to the "Wi-Fi module" side). In practice it is the feeder's dedicated controller handling the motor, sensors, buttons, and LED indicators.
 
-The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3 Super Mini soldered to the same pads.
+The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3 Super Mini soldered to the same pads. Here you can use what evere choice of ESP32 board. Just change the GPIO pins in the code.
 
 | WBR3 Pad | ESP32-C3 | Direction | Function |
 |----------|----------|-----------|----------|
@@ -24,6 +24,8 @@ The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3
 | Pin 15   | GPIO21   | ESP → MCU | UART TX (WBR3 RXD — data to MCU) |
 | Pin 16   | GPIO20   | MCU → ESP | UART RX (WBR3 TXD — data from MCU) |
 | Pin EN   | GPIO10   | ESP → MCU | Module ready signal |
+<img width="475" height="380" alt="image" src="https://github.com/user-attachments/assets/bdd40574-5195-4e42-89a1-cfb5a307780d" />
+
 
 All signals are 3.3V — no level shifting required. GPIO10 has no strapping pin restrictions on the ESP32-C3, making it safe for use as a general output.
 
