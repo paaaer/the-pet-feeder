@@ -60,8 +60,20 @@ mqtt:
           retain: true
       # Publish initial sensor states
       - lambda: id(feeder_sensor).publish_state("Idle");
+      - mqtt.publish:
+          topic: ${topic_prefix}/feeder
+          payload: "Idle"
+          retain: true
       - lambda: id(mcu_sensor).publish_state("Disconnected");
+      - mqtt.publish:
+          topic: ${topic_prefix}/mcu
+          payload: "Disconnected"
+          retain: true
       - lambda: id(lock_sensor).publish_state("Unlocked");
+      - mqtt.publish:
+          topic: ${topic_prefix}/lock
+          payload: "Unlocked"
+          retain: true
       - script.execute: do_handshake
   on_disconnect:
     then:
@@ -183,35 +195,17 @@ text_sensor:
     name: "Feeder Status"
     id: feeder_sensor
     icon: "mdi:bowl"
-    on_value:
-      then:
-        - mqtt.publish:
-            topic: ${topic_prefix}/feeder
-            payload: !lambda "return x;"
-            retain: true
 
   - platform: template
     name: "MCU Status"
     id: mcu_sensor
     icon: "mdi:chip"
     entity_category: diagnostic
-    on_value:
-      then:
-        - mqtt.publish:
-            topic: ${topic_prefix}/mcu
-            payload: !lambda "return x;"
-            retain: true
 
   - platform: template
     name: "Lock Status"
     id: lock_sensor
     icon: "mdi:lock"
-    on_value:
-      then:
-        - mqtt.publish:
-            topic: ${topic_prefix}/lock
-            payload: !lambda "return x;"
-            retain: true
 
 script:
   # ── Tuya handshake ────────────────────────────────────────────────────────
@@ -235,6 +229,7 @@ script:
       - lambda: |-
           id(mcu_connected) = true;
           id(mcu_sensor).publish_state("Connected");
+          mqtt::global_mqtt_client->publish("${topic_prefix}/mcu", "Connected", 0, true);
       - logger.log: "Handshake complete"
 
   # ── Feed script ───────────────────────────────────────────────────────────
@@ -247,6 +242,10 @@ script:
     mode: single
     then:
       - lambda: id(feeder_sensor).publish_state("Feeding");
+      - mqtt.publish:
+          topic: ${topic_prefix}/feeder
+          payload: "Feeding"
+          retain: true
       - lambda: |-
           int n = portions;
           if (n < 1) n = 1;
@@ -278,9 +277,14 @@ script:
             - lambda: |-
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Error");
+                mqtt::global_mqtt_client->publish("${topic_prefix}/feeder", "Error", 0, true);
             - logger.log: "Feed timeout — no done signal received from MCU"
           else:
             - lambda: id(feeder_sensor).publish_state("Idle");
+            - mqtt.publish:
+                topic: ${topic_prefix}/feeder
+                payload: "Idle"
+                retain: true
 
 interval:
   - interval: 30s
@@ -384,6 +388,7 @@ interval:
               if (dp_id == 0x04 && dp_val == 0x00 && id(feeding_active)) {
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Idle");
+                mqtt::global_mqtt_client->publish("${topic_prefix}/feeder", "Idle", 0, true);
                 ESP_LOGI("tuya", "Feeding done — DP4=0");
               }
 
@@ -392,6 +397,7 @@ interval:
                 bool locked = (dp_val == 0x01);
                 id(feeder_locked) = locked;
                 id(lock_sensor).publish_state(locked ? "Locked" : "Unlocked");
+                mqtt::global_mqtt_client->publish("${topic_prefix}/lock", locked ? "Locked" : "Unlocked", 0, true);
                 ESP_LOGI("tuya", "Lock: %s", locked ? "LOCKED" : "UNLOCKED");
               }
 
@@ -426,6 +432,7 @@ interval:
               if (dp_id == 0x0B && id(feeding_active)) {
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Idle");
+                mqtt::global_mqtt_client->publish("${topic_prefix}/feeder", "Idle", 0, true);
                 ESP_LOGI("tuya", "Feeding done — CMD34 DP11");
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
