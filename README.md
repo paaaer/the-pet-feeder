@@ -26,6 +26,7 @@ The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3
 | Pin EN   | GPIO10   | ESP → MCU | Module ready signal |
 <img width="475" height="380" alt="image" src="https://github.com/user-attachments/assets/bdd40574-5195-4e42-89a1-cfb5a307780d" />
 
+<img width="390" height="395" alt="image" src="https://github.com/user-attachments/assets/9c042213-1d4c-42ea-8518-d168a61965e1" />
 
 All signals are 3.3V — no level shifting required. GPIO10 has no strapping pin restrictions on the ESP32-C3, making it safe for use as a general output.
 
