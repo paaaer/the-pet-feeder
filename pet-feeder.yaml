@@ -2,8 +2,8 @@
 # Set mqtt_debug to "true" to publish debug messages to wifi2mqtt/pet-feeder/debug
 # Set to "false" for normal operation to avoid MQTT spam
 substitutions:
-  device_name: pet-feeder
-  topic_prefix: wifi2mqtt/pet-feeder
+  device_name: pet-feeder # the name.
+  topic_prefix: wifi2mqtt/pet-feeder # Mqtt topic throught the code 
   mqtt_debug: "false"   # ← change to "true" to enable MQTT debug messages
 
 esphome:
