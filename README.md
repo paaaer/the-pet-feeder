@@ -1,4 +1,3 @@
-
 # Pet Feeder — ESPHome Firmware
 
 ESPHome firmware for a Tuya-based automatic pet feeder, replacing the original WBR3 Wi-Fi module with an ESP32-C3 Super Mini. The ESP32-C3 speaks the Tuya serial protocol directly to the feeder MCU over UART, and exposes control and status via MQTT to Home Assistant.
@@ -57,8 +56,9 @@ All frames follow this structure:
 ### Protocol versions
 
 - The original WBR3 always sent **v0 frames** (`55 AA 00 ...`) to the MCU.
-- The MCU always responds with **v3 frames** (`55 AA 03 ...`).
-- This firmware follows the same convention: we always send v0, and the MCU accepts it.
+- The MCU responds with **v3 frames** (`55 AA 03 ...`), confirmed from UART captures of the original WBR3.
+- The RX parser does not validate the version byte — it syncs on the `55 AA` header and reads the command from byte 3. The version byte (`buf[2]`) is accepted but ignored.
+- This firmware always sends v0 frames, which the MCU accepts.
 
 ---
 
