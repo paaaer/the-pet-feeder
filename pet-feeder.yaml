@@ -15,15 +15,18 @@ logger:
 
 ota:
   - platform: esphome
-    password: !secret ota_password
+    password: "e65a575ea5facec072c4c02ee4195dd6"
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 3min
   ap:
     ssid: "Pet-Feeder Fallback"
     password: !secret ap_password
-  # NOTE: do NOT stop blink on wifi connect — wait for MQTT connect below
 
 captive_portal:
 
@@ -34,7 +37,7 @@ mqtt:
   password: !secret mqtt_password
   client_id: ${device_name}
   topic_prefix: ${topic_prefix}
-  discovery: false
+  discovery: true
   birth_message:
     topic: ${topic_prefix}/availability
     payload: online
@@ -45,8 +48,8 @@ mqtt:
     retain: true
   on_connect:
     then:
-      # LED LOW = connected and good
-      - output.turn_on: status_led_output
+      # Signal MCU that WiFi module is ready — MCU will start sending heartbeats
+      - output.turn_on: mcu_en_pin
       - mqtt.publish:
           topic: ${topic_prefix}/availability
           payload: "online"
@@ -55,149 +58,73 @@ mqtt:
           topic: ${topic_prefix}/status
           payload: "Idle"
           retain: true
-      - mqtt.publish:
-          topic: ${topic_prefix}/locked
-          payload: !lambda "return id(feeder_locked) ? \"ON\" : \"OFF\";"
-          retain: true
+      - script.execute: do_handshake
   on_disconnect:
     then:
-      # LED HIGH = not connected
-      - output.turn_off: status_led_output
+      - lambda: "id(mcu_connected) = false;"
   on_message:
+    # Feed command from HA: payload = number of portions (1-12)
     - topic: ${topic_prefix}/feedCmd
       then:
-        - if:
-            condition:
-              lambda: "return !id(feeder_locked);"
-            then:
-              - script.execute:
-                  id: feed_script
-                  portions: !lambda "return id(portion_size).state;"
-    - topic: ${topic_prefix}/portion_size
-      then:
-        - lambda: |-
-            id(portion_size).publish_state(atoi(x.c_str()));
+        - script.execute:
+            id: feed_script
+            portions: !lambda "return atoi(x.c_str());"
 
-# ── PIN ASSIGNMENTS (ESP32-C3 Super Mini — confirmed manufacturer pinout) ────
+# ── PIN ASSIGNMENTS (ESP32-C3 Super Mini) ────────────────────────────────────
 #  WBR3 pad   → C3 GPIO  Function
 #  Pin 8 VCC  → 3V3      Power
 #  Pin 9 GND  → GND      Ground
-#  Pin 2 A_7  → GPIO21   Portion switch input
-#  Pin 4 A_11 → GPIO4    Audio play output
-#  Pin 5 A_2  → GPIO2    Motor relay output   ⚠ active-HIGH, strapping pin
-#  Pin16 TXD  → GPIO5    Feed button input    (direct — no PCB bridge needed)
-#  Pin10 A_12 → GPIO6    Status LED output    (GPIO15 on original ESP8266)
+#  Pin16 TXD  → GPIO20   UART RX (ESP receives MCU TX)
+#  Pin15 RXD  → GPIO21   UART TX (ESP sends to MCU RX)
+#  Pin EN     → GPIO2    WiFi module ready signal (driven high after handshake)
 # ─────────────────────────────────────────────────────────────────────────────
 
-globals:
-  - id: play_recording
-    type: bool
-    restore_value: yes
-    initial_value: 'true'
+uart:
+  id: tuya_uart
+  tx_pin: GPIO21
+  rx_pin: GPIO20
+  baud_rate: 9600
 
-  - id: feed_count
-    type: int
+output:
+  # EN pin: drive high to signal MCU that WiFi module is ready
+  - platform: gpio
+    id: mcu_en_pin
+    pin:
+      number: GPIO2
+      mode:
+        output: true
+
+globals:
+  - id: feeding_active
+    type: bool
     restore_value: no
-    initial_value: '0'
+    initial_value: 'false'
+
+  - id: mcu_heartbeat_seen
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: mcu_connected
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
   - id: feeder_locked
     type: bool
     restore_value: yes
     initial_value: 'false'
 
-output:
-  - platform: gpio
-    id: motor_output
-    pin: GPIO2
-
-  - platform: gpio
-    id: play_output
-    pin: GPIO4
-
-  - platform: gpio
-    id: status_led_output
-    pin: GPIO6
-    inverted: false
-
-switch:
-  - platform: output
-    id: motor_switch
-    name: "Motor"
-    output: motor_output
-    internal: true
-
-  - platform: output
-    id: play_switch
-    name: "Play"
-    output: play_output
-    internal: true
-
+button:
   - platform: template
-    name: "Recording"
-    id: recording_switch
-    icon: "mdi:account-voice"
-    entity_category: config
-    lambda: "return id(play_recording);"
-    turn_on_action:
-      - lambda: id(play_recording) = true;
-      - mqtt.publish:
-          topic: ${topic_prefix}/playStatus
-          payload: "ON"
-          retain: true
-    turn_off_action:
-      - lambda: id(play_recording) = false;
-      - mqtt.publish:
-          topic: ${topic_prefix}/playStatus
-          payload: "OFF"
-          retain: true
-
-binary_sensor:
-  # Portion counter — increments feed_count each time a portion passes
-  - platform: gpio
-    id: portion_switch
-    pin:
-      number: GPIO21
-      mode:
-        input: true
-        pullup: true
-      inverted: true
-    name: "Portion Switch"
-    internal: true
+    name: "Dispense Meal"
+    id: dispense_meal_button
+    icon: "mdi:bowl"
     on_press:
       then:
-        - lambda: "id(feed_count)++;"
-
-  # Physical feed button (WBR3 pin 16 / TXD pad — direct wire, no PCB mod)
-  # Short press        → feed one serving (if unlocked)
-  # Long press ≥ 3s    → lock (single beep) / unlock (double beep) toggle
-  - platform: gpio
-    id: feed_button
-    pin:
-      number: GPIO5
-      mode:
-        input: true
-        pullup: true
-      inverted: true
-    name: "Feed Button"
-    internal: true
-    on_multi_click:
-      # Short press: released within 800ms = one feed
-      - timing:
-          - ON for 20ms to 800ms
-          - OFF for at least 50ms
-        then:
-          - if:
-              condition:
-                lambda: "return !id(feeder_locked);"
-              then:
-                - script.execute:
-                    id: feed_script
-                    portions: 1
-      # Long press: held for at least 3 seconds = lock/unlock
-      - timing:
-          - ON for at least 3000ms
-        then:
-          - script.execute: lock_toggle_script
+        - script.execute:
+            id: feed_script
+            portions: !lambda "return (int)id(portion_size).state;"
 
 number:
   - platform: template
@@ -206,17 +133,11 @@ number:
     icon: "mdi:scale"
     entity_category: config
     min_value: 1
-    max_value: 10
+    max_value: 12
     step: 1
     restore_value: yes
     initial_value: 1
     optimistic: true
-    on_value:
-      then:
-        - mqtt.publish:
-            topic: ${topic_prefix}/portion_size
-            payload: !lambda "return to_string((int)x);"
-            retain: true
 
 sensor:
   - platform: wifi_signal
@@ -246,82 +167,70 @@ text_sensor:
               payload: !lambda "return x;"
 
 script:
-  # Play audio beep (100ms pulse on A_11 pad)
-  - id: play_script
+  # ── Tuya handshake ────────────────────────────────────────────────────────
+  # Sequence confirmed from WBR3 startup capture.
+  # WBR3 always sends v0 frames (55 AA 00 ...) to MCU.
+  # MCU responds with v3 frames (55 AA 03 ...).
+  - id: do_handshake
+    mode: restart
     then:
-      - switch.turn_on: play_switch
-      - delay: 100ms
-      - switch.turn_off: play_switch
+      - logger.log: "Sending full handshake sequence"
+      - uart.write: [0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0xFF]       # heartbeat
+      - delay: 200ms
+      - uart.write: [0x55, 0xAA, 0x00, 0x01, 0x00, 0x00, 0x00]       # product info query
+      - delay: 200ms
+      - uart.write: [0x55, 0xAA, 0x00, 0x02, 0x00, 0x00, 0x01]       # MCU state query
+      - delay: 200ms
+      - uart.write: [0x55, 0xAA, 0x00, 0x03, 0x00, 0x01, 0x04, 0x07] # WiFi: cloud connected
+      - delay: 200ms
+      - uart.write: [0x55, 0xAA, 0x00, 0x08, 0x00, 0x00, 0x07]       # CMD 0x08
+      - delay: 500ms
+      - lambda: "id(mcu_connected) = true;"
+      - mqtt.publish:
+          topic: ${topic_prefix}/mcu_status
+          payload: "Connected"
+          retain: true
+      - logger.log: "Handshake complete"
 
-  # Lock/unlock toggle — called from long press, non-blocking
-  - id: lock_toggle_script
-    mode: single
-    then:
-      - if:
-          condition:
-            lambda: "return id(feeder_locked);"
-          then:
-            # Currently locked → unlock: double beep
-            - lambda: "id(feeder_locked) = false;"
-            - script.execute: play_script
-            - delay: 300ms
-            - script.execute: play_script
-            - mqtt.publish:
-                topic: ${topic_prefix}/locked
-                payload: "OFF"
-                retain: true
-            - mqtt.publish:
-                topic: ${topic_prefix}/status
-                payload: "Unlocked"
-                retain: true
-          else:
-            # Currently unlocked → lock: single beep
-            - lambda: "id(feeder_locked) = true;"
-            - script.execute: play_script
-            - mqtt.publish:
-                topic: ${topic_prefix}/locked
-                payload: "ON"
-                retain: true
-            - mqtt.publish:
-                topic: ${topic_prefix}/status
-                payload: "Locked"
-                retain: true
-
-  # Feed: runs motor until feed_count reaches target portions (max 5s timeout)
+  # ── Feed script ───────────────────────────────────────────────────────────
+  # Checksum verified from capture:
+  #   n=1 → 0x17, n=2 → 0x18, n=4 → 0x1A  →  checksum = (0x16 + n) & 0xFF
+  # Feeding done: MCU CMD 0x07 DP4=0x00, or CMD 0x34 DP11 extended report.
   - id: feed_script
     parameters:
       portions: int
+    mode: single
     then:
       - mqtt.publish:
           topic: ${topic_prefix}/status
           payload: "Feeding"
           retain: true
+      - lambda: |-
+          int n = portions;
+          if (n < 1) n = 1;
+          if (n > 12) n = 12;
+          uint8_t checksum = (0x16 + n) & 0xFF;
+          uint8_t frame[] = {
+            0x55, 0xAA, 0x00, 0x06, 0x00, 0x08,
+            0x03, 0x02, 0x00, 0x04,
+            0x00, 0x00, 0x00, (uint8_t)n,
+            checksum
+          };
+          id(tuya_uart).write_array(frame, sizeof(frame));
+          id(feeding_active) = true;
+          ESP_LOGI("tuya", "Feed frame sent: %d portions checksum=0x%02X", n, checksum);
+      # Feeding done is detected in RX poll. 30s hard timeout.
+      - delay: 30s
       - if:
           condition:
-            lambda: "return id(play_recording);"
+            lambda: "return id(feeding_active);"
           then:
-            - script.execute: play_script
-            - delay: 3s
-      - switch.turn_on: motor_switch
-      - lambda: "id(feed_count) = 0;"
-      - wait_until:
-          condition:
-            lambda: "return id(feed_count) >= portions;"
-          timeout: 5s
-      - switch.turn_off: motor_switch
-      - if:
-          condition:
-            lambda: "return id(feed_count) >= portions;"
-          then:
-            - mqtt.publish:
-                topic: ${topic_prefix}/status
-                payload: "Idle"
-                retain: true
-          else:
+            - lambda: "id(feeding_active) = false;"
             - mqtt.publish:
                 topic: ${topic_prefix}/status
                 payload: "Error"
                 retain: true
+            - logger.log: "Feed timeout — no done signal received from MCU"
 
 interval:
   - interval: 30s
@@ -330,3 +239,125 @@ interval:
           topic: ${topic_prefix}/availability
           payload: "online"
           retain: true
+
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: "return !id(mcu_connected);"
+          then:
+            - logger.log: "MCU not connected — retrying handshake"
+            - script.execute: do_handshake
+
+  # ── UART RX poll (100ms) ──────────────────────────────────────────────────
+  # MCU sends Tuya v3 frames (55 AA 03 ...).
+  # We always reply with v0 frames (55 AA 00 ...) — MCU accepts this.
+  #
+  # Key frames from capture:
+  #   CMD 0x00 — heartbeat (reply with 55 AA 00 00 00 00 FF)
+  #   CMD 0x01 — product info (MCU sends its ID string, no reply needed)
+  #   CMD 0x07 — DP status report
+  #     DP4  (0x04): 0x00=idle/done, 0x02=feeding
+  #     DP25 (0x19): 0x00=unlocked, 0x01=locked
+  #   CMD 0x34 — extended feeding log (contains DP11 record)
+  - interval: 100ms
+    then:
+      - lambda: |-
+          static std::vector<uint8_t> buf;
+          while (id(tuya_uart).available()) {
+            uint8_t b;
+            id(tuya_uart).read_byte(&b);
+            buf.push_back(b);
+          }
+
+          while (buf.size() >= 6) {
+            // Sync to 55 AA header
+            if (buf[0] != 0x55 || buf[1] != 0xAA) {
+              buf.erase(buf.begin());
+              continue;
+            }
+
+            uint8_t  cmd         = buf[3];
+            uint16_t payload_len = (buf[4] << 8) | buf[5];
+            uint16_t full_len    = 6 + payload_len + 1;
+
+            if (buf.size() < full_len) break;
+
+            // ── CMD 0x00 Heartbeat ───────────────────────────────────────
+            if (cmd == 0x00) {
+              uint8_t hb[] = {0x55, 0xAA, 0x00, 0x00, 0x00, 0x00, 0xFF};
+              id(tuya_uart).write_array(hb, sizeof(hb));
+              if (!id(mcu_heartbeat_seen)) {
+                id(mcu_heartbeat_seen) = true;
+                ESP_LOGD("tuya", "First heartbeat seen");
+              }
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // ── CMD 0x01 Product info from MCU ──────────────────────────
+            if (cmd == 0x01) {
+              ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // ── CMD 0x02 MCU state report ────────────────────────────────
+            if (cmd == 0x02) {
+              ESP_LOGD("tuya", "CMD02 MCU state report");
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // ── CMD 0x07 DP status report ────────────────────────────────
+            // Payload: [dp_id][dp_type][val_len_hi][val_len_lo][val...]
+            if (cmd == 0x07 && payload_len >= 5 && buf.size() >= 7u + payload_len) {
+              uint8_t dp_id   = buf[6];
+              uint8_t dp_type = buf[7];
+              uint16_t val_len = (buf[8] << 8) | buf[9];
+              uint8_t dp_val  = buf[10];  // first/only value byte for bool/enum
+
+              ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
+
+              // DP4 (0x04) = feeding motor state
+              // 0x00 = idle/done, 0x01 = scheduled, 0x02 = feeding
+              if (dp_id == 0x04 && dp_val == 0x00 && id(feeding_active)) {
+                id(feeding_active) = false;
+                auto &mqtt = *mqtt::global_mqtt_client;
+                mqtt.publish("${topic_prefix}/status", "Idle", 0, true);
+                ESP_LOGI("tuya", "Feeding done — DP4=0");
+              }
+
+              // DP25 (0x19) = lock state from physical button
+              if (dp_id == 0x19) {
+                bool locked = (dp_val == 0x01);
+                id(feeder_locked) = locked;
+                auto &mqtt = *mqtt::global_mqtt_client;
+                mqtt.publish("${topic_prefix}/locked", locked ? "ON" : "OFF", 0, true);
+                ESP_LOGI("tuya", "Lock: %s", locked ? "LOCKED" : "UNLOCKED");
+              }
+
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // ── CMD 0x34 Extended feeding log ────────────────────────────
+            // Sent after feed completes. Contains DP11 record with timestamp.
+            // Use as fallback feeding-done signal.
+            if (cmd == 0x34 && payload_len >= 2) {
+              uint8_t dp_id = buf[6];
+              ESP_LOGI("tuya", "CMD34 DP%d extended report", dp_id);
+              if (dp_id == 0x0B && id(feeding_active)) {
+                id(feeding_active) = false;
+                auto &mqtt = *mqtt::global_mqtt_client;
+                mqtt.publish("${topic_prefix}/status", "Idle", 0, true);
+                ESP_LOGI("tuya", "Feeding done — CMD34 DP11");
+              }
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // Unknown — log and discard
+            ESP_LOGW("tuya", "Unknown CMD 0x%02X len=%d", cmd, payload_len);
+            buf.erase(buf.begin(), buf.begin() + full_len);
+          }
