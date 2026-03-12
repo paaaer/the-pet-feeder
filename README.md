@@ -1,6 +1,9 @@
 # Pet Feeder — ESPHome Firmware
 
-ESPHome firmware for a Tuya-based automatic pet feeder, replacing the original WBR3 Wi-Fi module with an ESP32-C3 Super Mini.
+ESPHome firmware for a Tuya-based automatic pet feeder(Miaosical, SC-A80W-DW), replacing the original WBR3 Wi-Fi module with an ESP32-C3 Super Mini.
+
+<img width="449" height="356" alt="image" src="https://github.com/user-attachments/assets/e5fef84b-e27f-462e-b66e-f866c2c98e26" />
+
 
 This is an [ESPHome](https://esphome.io/) project — ESPHome is a system for programming ESP32/ESP8266 microcontrollers using YAML configuration files, compiling to native firmware with no custom C++ required for most use cases. The ESP32-C3 speaks the Tuya serial protocol directly to the feeder control board over UART, publishes all state and control topics to an MQTT broker, and automatically appears as a device in [Home Assistant](https://www.home-assistant.io/) via MQTT discovery.
 
