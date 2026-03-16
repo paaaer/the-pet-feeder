@@ -9,6 +9,15 @@ substitutions:
 esphome:
   name: ${device_name}
   friendly_name: Pet Feeder
+  on_boot:
+    priority: -100  # Runs after GPIO outputs are initialised
+    then:
+      # Hold EN LOW until MQTT connects.
+      # On a full power cycle this creates the LOW→HIGH rising edge the MCU
+      # needs to start sending heartbeats. On an ESP32-only reboot (OTA etc.)
+      # the MCU ignores EN — the handshake is fired directly from on_connect.
+      - output.turn_off: mcu_en_pin
+      - logger.log: "Boot: EN pin LOW"
 
 esp32:
   board: esp32-c3-devkitm-1
@@ -84,10 +93,13 @@ mqtt:
           topic: ${topic_prefix}/lock
           payload: "Unlocked"
           retain: true
-      # Small delay then drive EN pin HIGH — MCU will start sending heartbeats.
-      # The first heartbeat received triggers the handshake (see RX poll below).
-      - delay: 500ms
+      # Drive EN HIGH — on a full power cycle this creates the rising edge
+      # the MCU needs. On an ESP32-only reboot the MCU ignores EN but the
+      # handshake below still works since we send the frames regardless.
       - output.turn_on: mcu_en_pin
+      - logger.log: "EN pin HIGH — starting handshake"
+      - delay: 1000ms
+      - script.execute: do_handshake
   on_disconnect:
     then:
       - output.turn_off: mcu_en_pin
@@ -127,7 +139,8 @@ uart:
   baud_rate: 9600
 
 output:
-  # EN pin: drive high to signal MCU that WiFi module is ready
+  # EN pin: signals MCU that WiFi module is ready.
+  # Driven LOW on boot via on_boot, HIGH in on_connect, LOW in on_disconnect.
   - platform: gpio
     id: mcu_en_pin
     pin:
@@ -275,7 +288,7 @@ script:
           if ("${mqtt_debug}" == std::string("true")) {
             char msg[64];
             snprintf(msg, sizeof(msg), "Feed sent: %d portions checksum=0x%02X", n, checksum);
-            mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+            mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string(msg), 0, false);
           }
       # Wait for RX poll to clear feeding_active. Exits immediately when done.
       - wait_until:
@@ -289,14 +302,8 @@ script:
             - lambda: |-
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Error");
-                mqtt::global_mqtt_client->publish("${topic_prefix}/feeder", "Error", 0, true);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/feeder"), std::string("Error"), 0, true);
             - logger.log: "Feed timeout — no done signal received from MCU"
-          else:
-            - lambda: id(feeder_sensor).publish_state("Idle");
-            - mqtt.publish:
-                topic: ${topic_prefix}/feeder
-                payload: "Idle"
-                retain: true
 
 interval:
   - interval: 30s
@@ -306,7 +313,7 @@ interval:
           payload: "online"
           retain: true
 
-  - interval: 15s
+  - interval: 5s
     then:
       - if:
           condition:
@@ -327,7 +334,7 @@ interval:
   #     DP4  (0x04): 0x00=idle/done, 0x01=scheduled, 0x02=feeding
   #     DP25 (0x19): 0x00=unlocked, 0x01=locked
   #   CMD 0x08 — MCU ack to our CMD 0x08 (no action needed)
-  #   CMD 0x1C — time sync ack   (no action needed)
+  #   CMD 0x1C — time sync request from MCU (reply with current unix time)
   #   CMD 0x34 — extended feeding log (contains DP11 record with timestamp)
   - interval: 100ms
     then:
@@ -358,8 +365,7 @@ interval:
               id(tuya_uart).write_array(hb, sizeof(hb));
               if (!id(mcu_heartbeat_seen)) {
                 id(mcu_heartbeat_seen) = true;
-                ESP_LOGD("tuya", "First heartbeat — triggering handshake");
-                id(do_handshake).execute();
+                ESP_LOGD("tuya", "First heartbeat received");
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
@@ -370,14 +376,16 @@ interval:
             // This is the real confirmation the MCU received our handshake frames.
             if (cmd == 0x01) {
               if ("${mqtt_debug}" == std::string("true"))
-                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", "CMD01 product info received", 0, false);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string("CMD01 product info received"), 0, false);
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
-              if (!id(mcu_connected)) {
-                id(mcu_connected) = true;
-                id(mcu_sensor).publish_state("Connected");
-                mqtt::global_mqtt_client->publish("${topic_prefix}/mcu", "Connected", 0, true);
-                ESP_LOGD("tuya", "MCU connected — CMD01 confirmed");
-              }
+              // Always set connected on CMD01 — no guard needed.
+              // CMD01 can arrive before the handshake script finishes all frames
+              // (MCU responds to frame 2 immediately), so a !mcu_connected guard
+              // would miss it. Setting it unconditionally is safe and idempotent.
+              id(mcu_connected) = true;
+              id(mcu_sensor).publish_state("Connected");
+              mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/mcu"), std::string("Connected"), 0, true);
+              ESP_LOGD("tuya", "MCU connected — CMD01 confirmed");
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -385,7 +393,7 @@ interval:
             // ── CMD 0x02 MCU state report ────────────────────────────────
             if (cmd == 0x02) {
               if ("${mqtt_debug}" == std::string("true"))
-                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", "CMD02 MCU state report", 0, false);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string("CMD02 MCU state report"), 0, false);
               ESP_LOGD("tuya", "CMD02 MCU state report");
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
@@ -422,7 +430,7 @@ interval:
                   snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val32=%u", dp_id, dp_type, dp_val32);
                 else
                   snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
-                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string(msg), 0, false);
               }
               if (dp_type == 0x02 && val_len == 4)
                 ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val32=%u", dp_id, dp_type, dp_val32);
@@ -433,7 +441,7 @@ interval:
               if (dp_id == 0x04 && dp_val == 0x00 && id(feeding_active)) {
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Idle");
-                mqtt::global_mqtt_client->publish("${topic_prefix}/feeder", "Idle", 0, true);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/feeder"), std::string("Idle"), 0, true);
                 ESP_LOGI("tuya", "Feeding done — DP4=0");
               }
 
@@ -442,7 +450,7 @@ interval:
                 bool locked = (dp_val == 0x01);
                 id(feeder_locked) = locked;
                 id(lock_sensor).publish_state(locked ? "Locked" : "Unlocked");
-                mqtt::global_mqtt_client->publish("${topic_prefix}/lock", locked ? "Locked" : "Unlocked", 0, true);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/lock"), std::string(locked ? "Locked" : "Unlocked"), 0, true);
                 ESP_LOGI("tuya", "Lock: %s", locked ? "LOCKED" : "UNLOCKED");
               }
 
@@ -457,16 +465,14 @@ interval:
               continue;
             }
 
-            // ── CMD 0x14 Time sync request ──────────────────────────────
-            // MCU requests current Unix time so it can timestamp feed events.
-            // We respond with CMD 0x1C containing the current time from SNTP.
-            // Format: 55 AA 00 1C 00 08 [4-byte unix time BE] [utc_hour_offset] [utc_min_offset] [checksum]
-            if (cmd == 0x14) {
+            // ── CMD 0x1C Time sync request (MCU → ESP) ──────────────────
+            // The MCU sends CMD 0x1C to request the current Unix timestamp.
+            // We respond with CMD 0x1C back (same command, ESP→MCU direction).
+            // Format: 55 AA 00 1C 00 08 [4-byte unix time BE] [hour offset] [min offset] [checksum]
+            if (cmd == 0x1C) {
               auto now = id(sntp_time).now();
               if (now.is_valid()) {
                 uint32_t unix_time = (uint32_t)now.timestamp;
-                // 13-byte frame: 6 header + 4 unix time + 1 hour offset + 1 min offset + 1 checksum
-                // Offset bytes 0,0 = UTC. MCU feed log timestamps will be in UTC.
                 uint8_t resp[13] = {
                   0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08,
                   (uint8_t)(unix_time >> 24),
@@ -475,26 +481,19 @@ interval:
                   (uint8_t)(unix_time),
                   0x00,  // UTC hour offset
                   0x00,  // UTC minute offset
-                  0x00   // checksum — computed below
+                  0x00   // checksum placeholder
                 };
                 uint8_t cs = 0;
                 for (int i = 0; i < 12; i++) cs += resp[i];
                 resp[12] = cs;
                 id(tuya_uart).write_array(resp, 13);
-                ESP_LOGD("tuya", "CMD14 time sync: unix=%u cs=0x%02X", unix_time, cs);
+                ESP_LOGV("tuya", "CMD1C time sync: unix=%u cs=0x%02X", unix_time, cs);
               } else {
                 // SNTP not yet synced — send zeroed time, MCU will retry
-                uint8_t resp[] = {0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08, 0,0,0,0, 0,0, 0x23};  // checksum: 0x55+0xAA+0x00+0x1C+0x00+0x08 = 0x23
+                uint8_t resp[] = {0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08, 0,0,0,0, 0,0, 0x23};
                 id(tuya_uart).write_array(resp, sizeof(resp));
-                ESP_LOGW("tuya", "CMD14 time sync requested but SNTP not ready — sending zero");
+                ESP_LOGV("tuya", "CMD1C time sync: SNTP not ready, sending zero");
               }
-              buf.erase(buf.begin(), buf.begin() + full_len);
-              continue;
-            }
-
-            // ── CMD 0x1C Time sync ack ───────────────────────────────────
-            if (cmd == 0x1C) {
-              ESP_LOGV("tuya", "CMD1C time sync ack");
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -506,13 +505,13 @@ interval:
               if ("${mqtt_debug}" == std::string("true")) {
                 char msg[48];
                 snprintf(msg, sizeof(msg), "CMD34 DP%d extended report", dp_id);
-                mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string(msg), 0, false);
               }
               ESP_LOGI("tuya", "CMD34 DP%d extended report", dp_id);
               if (dp_id == 0x0B && id(feeding_active)) {
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Idle");
-                mqtt::global_mqtt_client->publish("${topic_prefix}/feeder", "Idle", 0, true);
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/feeder"), std::string("Idle"), 0, true);
                 ESP_LOGI("tuya", "Feeding done — CMD34 DP11");
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
@@ -523,7 +522,7 @@ interval:
             if ("${mqtt_debug}" == std::string("true")) {
               char msg[48];
               snprintf(msg, sizeof(msg), "Unknown CMD 0x%02X len=%d", cmd, payload_len);
-              mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
+              mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string(msg), 0, false);
             }
             ESP_LOGW("tuya", "Unknown CMD 0x%02X len=%d", cmd, payload_len);
             buf.erase(buf.begin(), buf.begin() + full_len);
