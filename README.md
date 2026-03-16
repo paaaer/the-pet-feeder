@@ -78,7 +78,46 @@ All frames follow this structure:
 
 ## Startup Handshake
 
-After the EN pin goes HIGH, the MCU starts sending heartbeats. On the first MQTT connection the firmware sends the full 5-frame handshake sequence that the WBR3 used, confirmed from UART captures of the original module. Each frame is sent with a 200ms delay between them.
+The boot sequence is fully event-driven — the firmware waits for actual evidence the MCU is alive before proceeding at each step, rather than using fixed timing.
+
+### Boot sequence
+
+```
+MQTT connects
+     │
+     ▼
+500ms delay (let MCU settle)
+     │
+     ▼
+EN pin → HIGH  (GPIO10)
+MCU starts sending heartbeats
+     │
+     ▼
+First heartbeat received
+→ handshake script fires
+     │
+     ▼
+5-frame handshake sent (200ms between each frame):
+  55 AA 00 00 00 00 FF        heartbeat
+  55 AA 00 01 00 00 00        product info query
+  55 AA 00 02 00 00 01        MCU state query
+  55 AA 00 03 00 01 04 07     WiFi status: cloud connected
+  55 AA 00 08 00 00 07        functional test
+     │
+     ▼
+MCU replies with CMD 0x01 (product info string)
+→ mcu_connected = true
+→ MCU sensor set to "Connected"
+     │
+     ▼
+MCU begins sending regular DP status reports
+```
+
+### Disconnect / reconnect
+
+On MQTT disconnect the EN pin is driven **LOW**, which resets the MCU's communication state cleanly. Both `mcu_connected` and `mcu_heartbeat_seen` are cleared. On the next MQTT connect the full sequence above repeats from the beginning.
+
+### Handshake frames
 
 | Step | Frame (hex) | Purpose |
 |------|------------|---------|
@@ -88,9 +127,11 @@ After the EN pin goes HIGH, the MCU starts sending heartbeats. On the first MQTT
 | 4 | `55 AA 00 03 00 01 04 07` | WiFi status: cloud connected |
 | 5 | `55 AA 00 08 00 00 07` | Functional test (CMD 0x08) |
 
-After the handshake the MCU begins sending regular heartbeats and DP status reports.
+### Connection confirmation
 
-If the MCU connection is lost, the 15-second interval will retry the handshake automatically.
+`mcu_connected` is only set to `true` when the MCU responds with a **CMD 0x01 product info frame** — this is the real confirmation that the MCU received the handshake frames. Simply sending the frames and waiting is not enough; the MCU must prove it responded.
+
+If the MCU never sends CMD 0x01, `mcu_connected` stays `false` and the 15-second retry interval will re-fire the handshake automatically.
 
 ---
 
@@ -172,6 +213,15 @@ The MCU sends its product ID string after the product info query. No reply requi
 
 Sent in response to our state query during handshake. Contains a dump of all current DP values. No reply required. Logged at DEBUG level.
 
+### CMD 0x03 — WiFi status query
+
+The MCU sends this after a reconnect to ask the Wi-Fi module to resend its WiFi status. We reply with the same cloud-connected frame used in the handshake.
+
+```
+MCU  → 55 AA 03 03 00 00 ...
+ESP  → 55 AA 00 03 00 01 04 07   (cloud connected)
+```
+
 ### CMD 0x07 — DP status report
 
 The main status update frame. Sent whenever a DP value changes, and also periodically as a keepalive. Payload structure:
@@ -230,7 +280,7 @@ The firmware sends UTC time with hour/minute offset both set to zero. This means
 |----|------|-----------|------|-------|
 | DP3  `0x03` | Feed trigger | ESP → MCU | integer | Number of portions to dispense |
 | DP4  `0x04` | Motor state  | MCU → ESP | enum | 0=idle, 1=scheduled, 2=feeding |
-| DP10 `0x0A` | Unknown      | MCU → ESP | —    | Observed in captures, purpose unknown |
+| DP10 `0x0A` | Unknown (counter?) | MCU → ESP | 4-byte int | Fires once per feed cycle and as a 60s keepalive; always `0` so far — purpose unknown |
 | DP11 `0x0B` | Feed log     | MCU → ESP | —    | Appears in CMD 0x34 extended report |
 | DP14 `0x0E` | Unknown      | MCU → ESP | —    | Observed in captures, purpose unknown |
 | DP25 `0x19` | Lock state   | MCU → ESP | bool | Physical lock button on feeder |
@@ -308,7 +358,7 @@ The `feed_script` runs in `mode: single` — it cannot be triggered again while 
 The MCU is requesting a time sync. This is now handled — after flashing the updated firmware with SNTP, these warnings will be replaced by `CMD14 time sync` debug messages.
 
 **MCU not connecting / handshake not completing:**
-The 15-second interval will retry the handshake automatically. Check that GPIO10 (EN pin) is wired correctly — the MCU will not send heartbeats until this pin goes HIGH.
+The firmware waits for the first heartbeat from the MCU before sending the handshake. If the MCU never sends a heartbeat, the EN pin (GPIO10) may not be wired correctly or the MCU may not be powered. The 15-second retry interval will re-attempt the handshake automatically. Check the log for "First heartbeat — triggering handshake" to confirm the MCU is responding.
 
 ---
 
