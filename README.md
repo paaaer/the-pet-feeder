@@ -269,7 +269,7 @@ The response frame format is:
 |----|------|-----------|------|-------|
 | DP3  `0x03` | Feed trigger | ESP → MCU | integer | Number of portions to dispense |
 | DP4  `0x04` | Motor state  | MCU → ESP | enum | 0=idle, 1=scheduled, 2=feeding |
-| DP10 `0x0A` | Unknown (counter?) | MCU → ESP | 4-byte int | Fires once per feed cycle and as a 60s keepalive; always `0` so far — purpose unknown |
+| DP10 `0x0A` | Unknown | MCU → ESP | 4-byte int | Fires once per feed cycle and every 60s as keepalive; value is consistently `100` — purpose unknown, possibly food level or a timer |
 | DP11 `0x0B` | Feed log     | MCU → ESP | —    | Appears in CMD 0x34 extended report |
 | DP14 `0x0E` | Unknown      | MCU → ESP | —    | Observed in captures, purpose unknown |
 | DP25 `0x19` | Lock state   | MCU → ESP | bool | Physical lock button on feeder |
@@ -280,16 +280,45 @@ The response frame format is:
 
 All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 
-| Topic | Direction | Retained | Values | Description |
-|-------|-----------|----------|--------|-------------|
-| `availability` | ESP → HA | yes | `online` / `offline` | LWT — offline set by broker on disconnect |
-| `feeder` | ESP → HA | yes | `Idle` / `Feeding` / `Error` | Feeder motor state |
-| `mcu` | ESP → HA | yes | `Connected` / `Disconnected` | MCU handshake state |
-| `lock` | ESP → HA | yes | `Locked` / `Unlocked` | Physical lock button state |
-| `rssi` | ESP → HA | yes | dBm integer | WiFi signal strength, updated every 60s |
-| `ip` | ESP → HA | no | IP address string | Device IP, updated on change |
-| `feedCmd` | HA → ESP | no | `1`–`12` | Trigger a feed cycle with N portions |
-| `debug` | ESP → HA | no | text | Debug messages, only published when `mqtt_debug: "true"` |
+### State topics (ESP → HA)
+
+| Topic | Retained | Values | Description |
+|-------|----------|--------|-------------|
+| `availability` | yes | `online` / `offline` | LWT — broker sets `offline` on disconnect, firmware sets `online` on connect |
+| `feeder` | yes | `Idle` / `Feeding` / `Error` | Feeder motor state. Set by MCU responses — never by a timer |
+| `mcu` | yes | `Connected` / `Disconnected` | MCU handshake state |
+| `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body |
+| `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
+| `ip` | no | IP address string | Device IP address, updated on change |
+| `debug` | no | text | UART debug messages — only published when `mqtt_debug: "true"` |
+
+### Command topics (HA → ESP)
+
+| Topic | Values | Description |
+|-------|--------|-------------|
+| `feedCmd` | `1`–`12` | Trigger a feed cycle. Payload is the number of portions to dispense |
+
+### Home Assistant discovery
+
+ESPHome publishes MQTT discovery messages automatically to `homeassistant/sensor/pet-feeder/...` on every connect. This creates the following entities in Home Assistant:
+
+| Entity | Type | Topic |
+|--------|------|-------|
+| Feeder Status | Sensor | `wifi2mqtt/pet-feeder/feeder` |
+| MCU Status | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/mcu` |
+| Lock Status | Sensor | `wifi2mqtt/pet-feeder/lock` |
+| RSSI | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/rssi` |
+| IP | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/ip` |
+| Portion Size | Number | `wifi2mqtt/pet-feeder/number/portion_size/state` |
+| Dispense Meal | Button | `wifi2mqtt/pet-feeder/button/dispense_meal/command` |
+
+The `state_topic` for each sensor is explicitly set in the firmware to match the clean topic paths above, ensuring the discovery config and state publishes use the same topic.
+
+### Topic notes
+
+- All state topics use `retain: true` so Home Assistant always has the last known state after a restart.
+- `availability` uses the MQTT LWT (Last Will and Testament) mechanism — the broker automatically publishes `offline` if the device disconnects unexpectedly.
+- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is only set on a 30-second timeout with no MCU response.
 
 ---
 
@@ -343,11 +372,11 @@ Available levels from quietest to loudest: `ERROR`, `WARN`, `INFO`, `DEBUG`, `VE
 **Feeder stuck on "Feeding" / feed button does nothing after one use:**
 The `feed_script` runs in `mode: single` — it cannot be triggered again while already running. If the script timed out or errored, check that `feeding_active` was cleared. A reboot will always reset the state.
 
-**"Unknown CMD 0x14" warnings in log:**
-The MCU is requesting a time sync. This is now handled — after flashing the updated firmware with SNTP, these warnings will be replaced by `CMD14 time sync` debug messages.
+**CMD1C time sync spam at VERBOSE level:**
+The MCU sends CMD 0x1C every second requesting a time sync. This is handled and logged at VERBOSE level only — invisible at normal DEBUG level.
 
 **MCU not connecting / handshake not completing:**
-The firmware waits for the first heartbeat from the MCU before sending the handshake. If the MCU never sends a heartbeat, the EN pin (GPIO10) may not be wired correctly or the MCU may not be powered. The 15-second retry interval will re-attempt the handshake automatically. Check the log for "First heartbeat — triggering handshake" to confirm the MCU is responding.
+The handshake fires directly from `on_connect`. If `mcu_connected` never becomes true, the **5-second retry interval** will re-fire the handshake automatically. Check the log for `CMD01 product info received` — that's the confirmation the MCU received the handshake. If it never appears, check GPIO10 (EN pin) wiring.
 
 ---
 
