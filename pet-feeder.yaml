@@ -64,8 +64,6 @@ mqtt:
     retain: true
   on_connect:
     then:
-      # Drive EN pin high — signals MCU that WiFi module is ready
-      - output.turn_on: mcu_en_pin
       - mqtt.publish:
           topic: ${topic_prefix}/availability
           payload: "online"
@@ -86,10 +84,16 @@ mqtt:
           topic: ${topic_prefix}/lock
           payload: "Unlocked"
           retain: true
-      - script.execute: do_handshake
+      # Small delay then drive EN pin HIGH — MCU will start sending heartbeats.
+      # The first heartbeat received triggers the handshake (see RX poll below).
+      - delay: 500ms
+      - output.turn_on: mcu_en_pin
   on_disconnect:
     then:
-      - lambda: "id(mcu_connected) = false;"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_heartbeat_seen) = false;
   on_message:
     # Feed command from HA: payload = number of portions (1-12)
     - topic: ${topic_prefix}/feedCmd
@@ -238,11 +242,7 @@ script:
       - delay: 200ms
       - uart.write: [0x55, 0xAA, 0x00, 0x08, 0x00, 0x00, 0x07]       # CMD 0x08
       - delay: 500ms
-      - lambda: |-
-          id(mcu_connected) = true;
-          id(mcu_sensor).publish_state("Connected");
-          mqtt::global_mqtt_client->publish("${topic_prefix}/mcu", "Connected", 0, true);
-      - logger.log: "Handshake complete"
+      - logger.log: "Handshake frames sent — waiting for CMD01 confirmation"
 
   # ── Feed script ───────────────────────────────────────────────────────────
   # Checksum verified from capture:
@@ -358,17 +358,26 @@ interval:
               id(tuya_uart).write_array(hb, sizeof(hb));
               if (!id(mcu_heartbeat_seen)) {
                 id(mcu_heartbeat_seen) = true;
-                ESP_LOGV("tuya", "First heartbeat seen");
+                ESP_LOGD("tuya", "First heartbeat — triggering handshake");
+                id(do_handshake).execute();
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
 
             // ── CMD 0x01 Product info from MCU ──────────────────────────
+            // MCU sends this in response to our CMD 0x01 query during handshake.
+            // This is the real confirmation the MCU received our handshake frames.
             if (cmd == 0x01) {
               if ("${mqtt_debug}" == std::string("true"))
                 mqtt::global_mqtt_client->publish("${topic_prefix}/debug", "CMD01 product info received", 0, false);
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
+              if (!id(mcu_connected)) {
+                id(mcu_connected) = true;
+                id(mcu_sensor).publish_state("Connected");
+                mqtt::global_mqtt_client->publish("${topic_prefix}/mcu", "Connected", 0, true);
+                ESP_LOGD("tuya", "MCU connected — CMD01 confirmed");
+              }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -382,19 +391,43 @@ interval:
               continue;
             }
 
+            // ── CMD 0x03 WiFi status query from MCU ──────────────────────
+            // MCU asks us to resend WiFi status, e.g. after a reconnect.
+            // Reply with the same frame we send during handshake: cloud connected (0x04).
+            if (cmd == 0x03) {
+              uint8_t wifi_status[] = {0x55, 0xAA, 0x00, 0x03, 0x00, 0x01, 0x04, 0x07};
+              id(tuya_uart).write_array(wifi_status, sizeof(wifi_status));
+              ESP_LOGD("tuya", "CMD03 WiFi status query — replied cloud connected");
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
             // ── CMD 0x07 DP status report ────────────────────────────────
             // Payload: [dp_id][dp_type][val_len_hi][val_len_lo][val...]
             if (cmd == 0x07 && payload_len >= 5 && buf.size() >= 7u + payload_len) {
               uint8_t dp_id    = buf[6];
               uint8_t dp_type  = buf[7];
+              uint16_t val_len = (buf[8] << 8) | buf[9];
               uint8_t dp_val   = buf[10];  // first value byte (bool/enum)
+              // For 4-byte integers (type 0x02) read the full value
+              uint32_t dp_val32 = 0;
+              if (dp_type == 0x02 && val_len == 4 && buf.size() >= 14u) {
+                dp_val32 = ((uint32_t)buf[10] << 24) | ((uint32_t)buf[11] << 16) |
+                           ((uint32_t)buf[12] <<  8) |  (uint32_t)buf[13];
+              }
 
               if ("${mqtt_debug}" == std::string("true")) {
-                char msg[64];
-                snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
+                char msg[72];
+                if (dp_type == 0x02 && val_len == 4)
+                  snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val32=%u", dp_id, dp_type, dp_val32);
+                else
+                  snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
                 mqtt::global_mqtt_client->publish("${topic_prefix}/debug", msg, 0, false);
               }
-              ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
+              if (dp_type == 0x02 && val_len == 4)
+                ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val32=%u", dp_id, dp_type, dp_val32);
+              else
+                ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
 
               // DP4 (0x04) = feeding motor state: 0x00=idle/done
               if (dp_id == 0x04 && dp_val == 0x00 && id(feeding_active)) {
