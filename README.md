@@ -82,40 +82,33 @@ The boot sequence is fully event-driven — the firmware waits for actual eviden
 
 ### Boot sequence
 
+The firmware handles two distinct boot scenarios:
+
+**Full power cycle (both ESP32 and feeder board powered together):**
 ```
-MQTT connects
-     │
-     ▼
-500ms delay (let MCU settle)
-     │
-     ▼
-EN pin → HIGH  (GPIO10)
-MCU starts sending heartbeats
-     │
-     ▼
-First heartbeat received
-→ handshake script fires
-     │
-     ▼
-5-frame handshake sent (200ms between each frame):
-  55 AA 00 00 00 00 FF        heartbeat
-  55 AA 00 01 00 00 00        product info query
-  55 AA 00 02 00 00 01        MCU state query
-  55 AA 00 03 00 01 04 07     WiFi status: cloud connected
-  55 AA 00 08 00 00 07        functional test
-     │
-     ▼
-MCU replies with CMD 0x01 (product info string)
-→ mcu_connected = true
-→ MCU sensor set to "Connected"
-     │
-     ▼
-MCU begins sending regular DP status reports
+Power on → on_boot: EN LOW (held)
+         → WiFi + MQTT connect
+         → on_connect: EN HIGH → rising edge
+         → MCU wakes, sends heartbeats
+         → 1s delay → handshake fires
+         → MCU replies CMD01 → mcu_connected = true ✅
 ```
+
+**ESP32-only reboot (OTA flash, crash, etc.):**
+```
+Reboot → on_boot: EN LOW (MCU already running, ignores it)
+       → WiFi + MQTT connect
+       → on_connect: EN HIGH (MCU ignores it)
+       → 1s delay → handshake fires directly
+       → MCU replies CMD01 → mcu_connected = true ✅
+       → 5s retry interval keeps retrying if no CMD01 ✅
+```
+
+The EN pin on this board is only sampled at MCU power-on. Toggling EN at runtime has no effect on an already-running MCU — the handshake is always fired directly from `on_connect` regardless.
 
 ### Disconnect / reconnect
 
-On MQTT disconnect the EN pin is driven **LOW**, which resets the MCU's communication state cleanly. Both `mcu_connected` and `mcu_heartbeat_seen` are cleared. On the next MQTT connect the full sequence above repeats from the beginning.
+On MQTT disconnect the EN pin is driven **LOW** and both `mcu_connected` and `mcu_heartbeat_seen` are cleared. On the next MQTT reconnect the full sequence repeats from the beginning.
 
 ### Handshake frames
 
@@ -129,9 +122,9 @@ On MQTT disconnect the EN pin is driven **LOW**, which resets the MCU's communic
 
 ### Connection confirmation
 
-`mcu_connected` is only set to `true` when the MCU responds with a **CMD 0x01 product info frame** — this is the real confirmation that the MCU received the handshake frames. Simply sending the frames and waiting is not enough; the MCU must prove it responded.
+`mcu_connected` is set to `true` when the MCU responds with a **CMD 0x01 product info frame**. This is the real confirmation the MCU received the handshake. CMD 0x01 can arrive before the handshake script finishes sending all frames (the MCU responds to frame 2 almost immediately), so the handler always sets connected unconditionally when CMD 0x01 is received.
 
-If the MCU never sends CMD 0x01, `mcu_connected` stays `false` and the 15-second retry interval will re-fire the handshake automatically.
+If CMD 0x01 never arrives, `mcu_connected` stays `false` and the **5-second retry interval** re-fires the handshake automatically until it succeeds.
 
 ---
 
@@ -215,7 +208,7 @@ Sent in response to our state query during handshake. Contains a dump of all cur
 
 ### CMD 0x03 — WiFi status query
 
-The MCU sends this after a reconnect to ask the Wi-Fi module to resend its WiFi status. We reply with the same cloud-connected frame used in the handshake.
+The MCU sends this after a reconnect to ask the Wi-Fi module to resend its WiFi status. We reply with the same cloud-connected frame used in the handshake. Observed in the log immediately after MQTT reconnects.
 
 ```
 MCU  → 55 AA 03 03 00 00 ...
@@ -243,34 +236,30 @@ Other DPs are logged but not acted on. Note: DP4 fires periodically as a keepali
 
 The MCU acknowledges our CMD 0x08 sent during handshake. No action required. Logged at VERBOSE level.
 
-### CMD 0x1C — Time sync ack
+### CMD 0x1C — Time sync request
 
-The MCU acknowledges a time sync. Logged at VERBOSE level (no action).
+The MCU sends CMD 0x1C every second to request the current Unix timestamp. We respond with CMD 0x1C back (same command number, ESP→MCU direction) containing the current UTC time from SNTP. If SNTP has not yet synced, a zeroed timestamp is sent and the MCU will retry on the next request.
 
 ### CMD 0x34 — Extended feeding log
 
 Sent by the MCU after a feed cycle completes. Contains a DP11 record with a timestamp of the feeding event for the MCU's internal log.
 
-Used as a **fallback feeding-done signal**: if CMD 0x07 DP4=0x00 was missed for any reason, CMD 0x34 DP11 (`0x0B`) will also clear `feeding_active` and set the feeder sensor to Idle.
+Used as the **primary feeding-done signal**: CMD 0x34 DP11 (`0x0B`) clears `feeding_active` and sets the feeder sensor to Idle. CMD 0x07 DP4=0x00 serves as a secondary confirmation that also arrives shortly after.
 
 ---
 
-## Commands — Implemented (MCU → ESP, requires response)
-
-### CMD 0x14 — Time sync request
+## Notes on time sync
 
 The MCU sends this command periodically to request the current Unix timestamp so it can timestamp feed events in its internal log.
 
-This is now implemented. The ESP32 runs an SNTP client (`pool.ntp.org`) and responds with a CMD 0x1C frame containing the current UTC Unix timestamp. If SNTP has not yet synced at the time of the request, a zeroed timestamp is sent and the MCU will retry.
+The time sync command is CMD 0x1C in both directions — the MCU sends it as a request and the ESP responds with the same command containing the current Unix timestamp. The original WBR3 protocol documentation labels this as CMD 0x14 (request) / CMD 0x1C (response), but on this feeder board the MCU uses CMD 0x1C for both request and response.
 
-**Response frame (CMD 0x1C):**
+The firmware responds with UTC Unix time and zero hour/minute offsets. SNTP servers `pool.ntp.org` and `time.google.com` are used. Timezone is set to `Europe/Stockholm` in the config — adjust as needed.
+
+The response frame format is:
 ```
 55 AA 00 1C 00 08 [4-byte unix time, big-endian] [hour offset] [minute offset] [checksum]
 ```
-
-The firmware sends UTC time with hour/minute offset both set to zero. This means the MCU's internal feed log timestamps will be in UTC rather than local time, which is acceptable for our purposes.
-
-**SNTP configuration:** `pool.ntp.org` and `time.google.com` are used as servers. The timezone is set to `Europe/Stockholm` in the ESPHome config — adjust this to your local timezone if needed.
 
 ---
 
@@ -316,18 +305,18 @@ MQTT connect
      ▼                                                │
  [Feeding]                                            │
      │                                                │
-     ├── CMD07 DP4=0x00 received ────────────────────►┤
-     ├── CMD34 DP11 received ─────────────────────────┤
-     │                                                │
-     │  wait_until feeding_active=false (max 30s)     │
-     │                                                │
-     ├── done in time ───────────────────────────────►┘
+     ├── CMD34 DP11 received ─────────────────────────┤  (primary done signal)
+     ├── CMD07 DP4=0x00 received ────────────────────►┘  (secondary done signal)
      │
-     └── 30s timeout
+     │  wait_until feeding_active=false (max 30s)
+     │
+     └── 30s timeout — no done signal received
            │
            ▼
         [Error]
 ```
+
+`Idle` is set exclusively by the MCU via CMD34 DP11 or CMD07 DP4=0x00 — the feed script only sets `Error` on timeout.
 
 ---
 
