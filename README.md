@@ -1,9 +1,8 @@
 # Pet Feeder — ESPHome Firmware
 
-ESPHome firmware for a Tuya-based automatic pet feeder(Miaosical, SC-A80W-DW), replacing the original WBR3 Wi-Fi module with an ESP32-C3 Super Mini.
+ESPHome firmware for a Tuya-based automatic pet feeder (Miaosical SC-A80W-DW), replacing the original WBR3 Wi-Fi module with an ESP32-C3 Super Mini.
 
 <img width="449" height="356" alt="image" src="https://github.com/user-attachments/assets/e5fef84b-e27f-462e-b66e-f866c2c98e26" />
-
 
 This is an [ESPHome](https://esphome.io/) project — ESPHome is a system for programming ESP32/ESP8266 microcontrollers using YAML configuration files, compiling to native firmware with no custom C++ required for most use cases. The ESP32-C3 speaks the Tuya serial protocol directly to the feeder control board over UART, publishes all state and control topics to an MQTT broker, and automatically appears as a device in [Home Assistant](https://www.home-assistant.io/) via MQTT discovery.
 
@@ -15,7 +14,7 @@ This is an [ESPHome](https://esphome.io/) project — ESPHome is a system for pr
 
 The feeder's main control board carries the marking **A90_YP_2301WIFI_V1.0_W**. Throughout this firmware and the Tuya serial protocol documentation, this board is referred to as the **MCU** — this is standard Tuya terminology for the non-Wi-Fi side of the protocol (as opposed to the "Wi-Fi module" side). In practice it is the feeder's dedicated controller handling the motor, sensors, buttons, and LED indicators.
 
-The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3 Super Mini soldered to the same pads. Here you can use what evere choice of ESP32 board. Just change the GPIO pins in the code.
+The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3 Super Mini soldered to the same pads.
 
 | WBR3 Pad | ESP32-C3 | Direction | Function |
 |----------|----------|-----------|----------|
@@ -24,6 +23,9 @@ The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3
 | Pin 15   | GPIO21   | ESP → MCU | UART TX (WBR3 RXD — data to MCU) |
 | Pin 16   | GPIO20   | MCU → ESP | UART RX (WBR3 TXD — data from MCU) |
 | Pin EN   | GPIO10   | ESP → MCU | Module ready signal |
+
+The ESP32-C3 Super Mini is used here, but any ESP32 board will work — just update the GPIO pin numbers in the YAML to match your board's pinout.
+
 <img width="475" height="380" alt="image" src="https://github.com/user-attachments/assets/bdd40574-5195-4e42-89a1-cfb5a307780d" />
 
 <img width="390" height="395" alt="image" src="https://github.com/user-attachments/assets/9c042213-1d4c-42ea-8518-d168a61965e1" />
@@ -203,20 +205,22 @@ Used as a **fallback feeding-done signal**: if CMD 0x07 DP4=0x00 was missed for 
 
 ---
 
-## Commands — Not Implemented
+## Commands — Implemented (MCU → ESP, requires response)
 
 ### CMD 0x14 — Time sync request
 
-The MCU sends this command periodically to request the current Unix timestamp from the Wi-Fi module. The original WBR3 would respond with a CMD 0x1C frame containing the current time so the MCU can timestamp feed events in its internal log accurately.
+The MCU sends this command periodically to request the current Unix timestamp so it can timestamp feed events in its internal log.
 
-Currently this command is received, logs a warning (`Unknown CMD 0x14`), and is discarded. The MCU's feed log timestamps will therefore be incorrect or zeroed.
+This is now implemented. The ESP32 runs an SNTP client (`pool.ntp.org`) and responds with a CMD 0x1C frame containing the current UTC Unix timestamp. If SNTP has not yet synced at the time of the request, a zeroed timestamp is sent and the MCU will retry.
 
-**Response format (not yet implemented):**
+**Response frame (CMD 0x1C):**
 ```
-55 AA 00 1C 00 08 [4-byte unix timestamp] [local hour offset] [local minute offset] [checksum]
+55 AA 00 1C 00 08 [4-byte unix time, big-endian] [hour offset] [minute offset] [checksum]
 ```
 
-Implementing this would require adding an SNTP `time` component to the ESPHome config to provide a real timestamp.
+The firmware sends UTC time with hour/minute offset both set to zero. This means the MCU's internal feed log timestamps will be in UTC rather than local time, which is acceptable for our purposes.
+
+**SNTP configuration:** `pool.ntp.org` and `time.google.com` are used as servers. The timezone is set to `Europe/Stockholm` in the ESPHome config — adjust this to your local timezone if needed.
 
 ---
 
@@ -274,6 +278,37 @@ MQTT connect
            ▼
         [Error]
 ```
+
+---
+
+## Debugging
+
+### MQTT debug messages
+
+Set `mqtt_debug: "true"` in the substitutions at the top of the YAML. This publishes diagnostic messages for every significant UART frame to `wifi2mqtt/pet-feeder/debug`. Events covered: feed frame sent, CMD07 DP values, CMD34 extended report, CMD14 time sync, and any unknown commands received. Set back to `"false"` for normal operation.
+
+### Serial log verbosity
+
+The `logger` component controls what appears in the ESPHome serial console (and the ESPHome dashboard log viewer). Change the level in the YAML:
+
+```yaml
+logger:
+  level: DEBUG    # normal — shows feeding events, DP changes, handshake
+  level: VERBOSE  # maximum — shows every heartbeat, CMD08 ack, CMD1C ack
+```
+
+Available levels from quietest to loudest: `ERROR`, `WARN`, `INFO`, `DEBUG`, `VERBOSE`.
+
+### Common error states
+
+**Feeder stuck on "Feeding" / feed button does nothing after one use:**
+The `feed_script` runs in `mode: single` — it cannot be triggered again while already running. If the script timed out or errored, check that `feeding_active` was cleared. A reboot will always reset the state.
+
+**"Unknown CMD 0x14" warnings in log:**
+The MCU is requesting a time sync. This is now handled — after flashing the updated firmware with SNTP, these warnings will be replaced by `CMD14 time sync` debug messages.
+
+**MCU not connecting / handshake not completing:**
+The 15-second interval will retry the handshake automatically. Check that GPIO10 (EN pin) is wired correctly — the MCU will not send heartbeats until this pin goes HIGH.
 
 ---
 
