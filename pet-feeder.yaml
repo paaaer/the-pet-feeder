@@ -2,8 +2,8 @@
 # Set mqtt_debug to "true" to publish debug messages to wifi2mqtt/pet-feeder/debug
 # Set to "false" for normal operation to avoid MQTT spam
 substitutions:
-  device_name: pet-feeder # the name.
-  topic_prefix: wifi2mqtt/pet-feeder # Mqtt topic throught the code 
+  device_name: pet-feeder
+  topic_prefix: wifi2mqtt/pet-feeder
   mqtt_debug: "false"   # ← change to "true" to enable MQTT debug messages
 
 esphome:
@@ -16,10 +16,22 @@ esp32:
     type: esp-idf
 
 logger:
+  level: DEBUG  # Set to VERBOSE for maximum serial output
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Stockholm
+    servers:
+      - pool.ntp.org
+      - time.google.com
+    on_time_sync:
+      then:
+        - logger.log: "SNTP time synchronised"
 
 ota:
   - platform: esphome
-    password: ""
+    password: "e65a575ea5facec072c4c02ee4195dd6"
 
 wifi:
   networks:
@@ -408,6 +420,42 @@ interval:
             // ── CMD 0x08 MCU ack ─────────────────────────────────────────
             if (cmd == 0x08) {
               ESP_LOGV("tuya", "CMD08 ack from MCU");
+              buf.erase(buf.begin(), buf.begin() + full_len);
+              continue;
+            }
+
+            // ── CMD 0x14 Time sync request ──────────────────────────────
+            // MCU requests current Unix time so it can timestamp feed events.
+            // We respond with CMD 0x1C containing the current time from SNTP.
+            // Format: 55 AA 00 1C 00 08 [4-byte unix time BE] [utc_hour_offset] [utc_min_offset] [checksum]
+            if (cmd == 0x14) {
+              auto now = id(sntp_time).now();
+              if (now.is_valid()) {
+                uint32_t unix_time = (uint32_t)now.timestamp;
+                // Send UTC unix time. The timezone string ("Europe/Stockholm") in the
+                // SNTP config means now.timestamp is correct UTC epoch seconds.
+                // Offset bytes: hour=0, min=0 (UTC). MCU feed log will show UTC time.
+                uint8_t resp[14] = {
+                  0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08,
+                  (uint8_t)(unix_time >> 24),
+                  (uint8_t)(unix_time >> 16),
+                  (uint8_t)(unix_time >>  8),
+                  (uint8_t)(unix_time),
+                  0x00,  // UTC hour offset
+                  0x00,  // UTC minute offset
+                  0x00   // checksum placeholder
+                };
+                uint8_t cs = 0;
+                for (int i = 0; i < 13; i++) cs += resp[i];
+                resp[13] = cs;
+                id(tuya_uart).write_array(resp, 14);
+                ESP_LOGD("tuya", "CMD14 time sync: unix=%u (UTC)", unix_time);
+              } else {
+                // SNTP not yet synced — send zeroed time, MCU will retry
+                uint8_t resp[] = {0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08, 0,0,0,0, 0,0, 0x23};  // checksum: 0x55+0xAA+0x00+0x1C+0x00+0x08 = 0x23
+                id(tuya_uart).write_array(resp, sizeof(resp));
+                ESP_LOGW("tuya", "CMD14 time sync requested but SNTP not ready — sending zero");
+              }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
