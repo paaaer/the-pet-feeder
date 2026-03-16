@@ -432,10 +432,9 @@ interval:
               auto now = id(sntp_time).now();
               if (now.is_valid()) {
                 uint32_t unix_time = (uint32_t)now.timestamp;
-                // Send UTC unix time. The timezone string ("Europe/Stockholm") in the
-                // SNTP config means now.timestamp is correct UTC epoch seconds.
-                // Offset bytes: hour=0, min=0 (UTC). MCU feed log will show UTC time.
-                uint8_t resp[14] = {
+                // 13-byte frame: 6 header + 4 unix time + 1 hour offset + 1 min offset + 1 checksum
+                // Offset bytes 0,0 = UTC. MCU feed log timestamps will be in UTC.
+                uint8_t resp[13] = {
                   0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08,
                   (uint8_t)(unix_time >> 24),
                   (uint8_t)(unix_time >> 16),
@@ -443,13 +442,13 @@ interval:
                   (uint8_t)(unix_time),
                   0x00,  // UTC hour offset
                   0x00,  // UTC minute offset
-                  0x00   // checksum placeholder
+                  0x00   // checksum — computed below
                 };
                 uint8_t cs = 0;
-                for (int i = 0; i < 13; i++) cs += resp[i];
-                resp[13] = cs;
-                id(tuya_uart).write_array(resp, 14);
-                ESP_LOGD("tuya", "CMD14 time sync: unix=%u (UTC)", unix_time);
+                for (int i = 0; i < 12; i++) cs += resp[i];
+                resp[12] = cs;
+                id(tuya_uart).write_array(resp, 13);
+                ESP_LOGD("tuya", "CMD14 time sync: unix=%u cs=0x%02X", unix_time, cs);
               } else {
                 // SNTP not yet synced — send zeroed time, MCU will retry
                 uint8_t resp[] = {0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08, 0,0,0,0, 0,0, 0x23};  // checksum: 0x55+0xAA+0x00+0x1C+0x00+0x08 = 0x23
