@@ -48,7 +48,7 @@ The EN pin (GPIO10) is held LOW at boot. The MCU will not begin sending heartbea
 
 ## Tuya Serial Protocol
 
-The feeder uses the standard Tuya serial protocol between the Wi-Fi module and the feeder MCU.
+The feeder uses the standard Tuya serial protocol between the Wi-Fi module and the feeder MCU. All protocol details below are confirmed from logic analyser captures of the original WBR3 module.
 
 ### Frame format
 
@@ -70,9 +70,17 @@ All frames follow this structure:
 ### Protocol versions
 
 - The original WBR3 always sent **v0 frames** (`55 AA 00 ...`) to the MCU.
-- The MCU responds with **v3 frames** (`55 AA 03 ...`), confirmed from UART captures of the original WBR3.
+- The MCU responds with **v3 frames** (`55 AA 03 ...`), confirmed from logic analyser captures.
 - The RX parser does not validate the version byte — it syncs on the `55 AA` header and reads the command from byte 3. The version byte (`buf[2]`) is accepted but ignored.
 - This firmware always sends v0 frames, which the MCU accepts.
+
+### Heartbeat status byte
+
+The MCU's CMD 0x00 heartbeat includes a status byte:
+- `0x00` — first heartbeat after power-on
+- `0x01` — subsequent heartbeats during normal operation
+
+The firmware replies with the same `55 AA 00 00 00 00 FF` regardless of status.
 
 ---
 
@@ -89,28 +97,37 @@ The firmware handles two distinct boot scenarios:
 Power on → on_boot: EN LOW (held)
          → WiFi + MQTT connect
          → on_connect: EN HIGH → rising edge
-         → MCU wakes, sends heartbeats
+         → MCU wakes, sends heartbeat (status=0x00)
          → 1s delay → handshake fires
          → MCU replies CMD01 → mcu_connected = true ✅
+         → MCU sends DP state dump (DP14, CMD34, DP25, DP4=0, DP10)
+         → DP4=0x00 received → mcu_ready = true ✅
 ```
 
-**ESP32-only reboot (OTA flash, crash, etc.):**
+**ESP32-only reboot (OTA flash, crash, daily reset, etc.):**
 ```
 Reboot → on_boot: EN LOW (MCU already running, ignores it)
        → WiFi + MQTT connect
        → on_connect: EN HIGH (MCU ignores it)
        → 1s delay → handshake fires directly
        → MCU replies CMD01 → mcu_connected = true ✅
+       → MCU sends DP state dump → mcu_ready = true ✅
        → 5s retry interval keeps retrying if no CMD01 ✅
 ```
 
 The EN pin on this board is only sampled at MCU power-on. Toggling EN at runtime has no effect on an already-running MCU — the handshake is always fired directly from `on_connect` regardless.
 
+### MCU readiness
+
+`mcu_connected` (CMD01 received) and `mcu_ready` (DP4=0x00 received in startup dump) are tracked separately. CMD01 arrives fast but the motor controller takes longer to initialise. The feed script waits up to 15 seconds for `mcu_ready` before sending a feed command, preventing a silent ignore on feeds triggered immediately after a power cycle.
+
 ### Disconnect / reconnect
 
-On MQTT disconnect the EN pin is driven **LOW** and both `mcu_connected` and `mcu_heartbeat_seen` are cleared. On the next MQTT reconnect the full sequence repeats from the beginning.
+On MQTT disconnect the EN pin is driven **LOW** and `mcu_connected`, `mcu_heartbeat_seen` and `mcu_ready` are all cleared. On the next MQTT reconnect the full sequence repeats.
 
 ### Handshake frames
+
+Confirmed from WBR3 logic analyser capture. Sent in order with 200ms delays between each:
 
 | Step | Frame (hex) | Purpose |
 |------|------------|---------|
@@ -119,12 +136,28 @@ On MQTT disconnect the EN pin is driven **LOW** and both `mcu_connected` and `mc
 | 3 | `55 AA 00 02 00 00 01` | MCU state query |
 | 4 | `55 AA 00 03 00 01 04 07` | WiFi status: cloud connected |
 | 5 | `55 AA 00 08 00 00 07` | Functional test (CMD 0x08) |
+| 6 | `55 AA 00 34 00 02 0B 00 40` | CMD34 DP11 ack (sent twice) |
+
+Steps 1–5 match the WBR3 startup sequence. Step 6 (CMD34 ack, sent twice) clears any pending feed acknowledgement state in the MCU — confirmed from WBR3 capture where this was sent at every startup.
 
 ### Connection confirmation
 
-`mcu_connected` is set to `true` when the MCU responds with a **CMD 0x01 product info frame**. This is the real confirmation the MCU received the handshake. CMD 0x01 can arrive before the handshake script finishes sending all frames (the MCU responds to frame 2 almost immediately), so the handler always sets connected unconditionally when CMD 0x01 is received.
+`mcu_connected` is set to `true` when the MCU responds with a **CMD 0x01 product info frame**. CMD 0x01 can arrive before the handshake script finishes sending all frames (the MCU responds to frame 2 almost immediately), so the handler always sets connected unconditionally.
 
-If CMD 0x01 never arrives, `mcu_connected` stays `false` and the **5-second retry interval** re-fires the handshake automatically until it succeeds.
+If CMD 0x01 never arrives, `mcu_connected` stays `false` and the **5-second retry interval** re-fires the handshake automatically.
+
+### Daily preventive reset
+
+The firmware reboots the ESP32 daily at **04:00** to prevent an MCU communication issue that develops after approximately 22 hours of continuous UART uptime. The sequence is:
+
+```
+04:00:00  EN LOW → MCU begins power-down
+04:00:02  ESP32 safe_reboot()
+          ↓ (boot sequence as above)
+04:00:10  MCU connected + ready ✅
+```
+
+Pulling EN LOW before the reboot ensures the MCU goes through a full power cycle, not just a UART handshake reset. The 04:00 time is well clear of both daily feed times.
 
 ---
 
@@ -140,7 +173,7 @@ Sent in response to every heartbeat received from the MCU.
 
 ### CMD 0x01 — Product info query
 
-Sent during handshake. MCU responds with its product ID string (CMD 0x01 response).
+Sent during handshake. MCU responds with its product ID string.
 
 ```
 55 AA 00 01 00 00 00
@@ -156,7 +189,7 @@ Sent during handshake. MCU responds with a dump of all current DP values.
 
 ### CMD 0x03 — WiFi status
 
-Sent during handshake to tell the MCU the WiFi module has connected to the cloud. Payload `0x04` = cloud connected, which causes the MCU to show a solid LED indicator.
+Sent during handshake and in response to MCU WiFi status queries. Payload `0x04` = cloud connected.
 
 ```
 55 AA 00 03 00 01 04 07
@@ -164,7 +197,7 @@ Sent during handshake to tell the MCU the WiFi module has connected to the cloud
 
 ### CMD 0x06 — Send DP (feed command)
 
-Triggers the feeding motor. The payload encodes DP3 (feed trigger) as a 4-byte integer value equal to the number of portions (1–12).
+Triggers the feeding motor. The payload encodes DP3 (feed trigger) as a 4-byte integer equal to the number of portions (1–12).
 
 ```
 55 AA 00 06 00 08 03 02 00 04 00 00 00 [N] [CHECKSUM]
@@ -176,7 +209,9 @@ Triggers the feeding motor. The payload encodes DP3 (feed trigger) as a 4-byte i
 | `02` | Type  | 4-byte integer |
 | `00 04` | Length | 4 bytes |
 | `00 00 00 N` | Value | Number of portions |
-| Checksum | `(0x16 + N) & 0xFF` | Verified from capture: N=1→0x17, N=2→0x18, N=4→0x1A |
+| Checksum | `(0x16 + N) & 0xFF` | N=1→0x17, N=2→0x18, N=3→0x19, N=4→0x1A, N=6→0x1C |
+
+**Important:** Immediately after CMD 0x06, the firmware sends a CMD 0x34 DP11 ack. This is required — confirmed from WBR3 captures where the ack was always sent proactively right after the feed command, not after receiving CMD 0x34 from the MCU. Without this ack the MCU may silently ignore the feed command after extended uptime.
 
 ### CMD 0x08 — Functional test
 
@@ -186,38 +221,59 @@ Sent during handshake. The MCU acknowledges with its own CMD 0x08 frame.
 55 AA 00 08 00 00 07
 ```
 
+### CMD 0x1C — Time sync reply
+
+Sent in response to CMD 0x1C from the MCU. Contains the current UTC Unix timestamp from SNTP.
+
+```
+55 AA 00 1C 00 08 [4-byte unix time, big-endian] [hour offset=0x00] [min offset=0x00] [checksum]
+```
+
+If SNTP has not yet synced, a zeroed frame is sent and the MCU retries on the next request.
+
+### CMD 0x34 — Feed acknowledgement
+
+Sent in two situations, confirmed from WBR3 captures:
+
+1. **Proactively after every CMD 0x06** — immediately after the feed command, before the MCU responds. Required for the MCU to accept the feed.
+2. **Twice during handshake** — clears any pending ack state from before the ESP32 connected.
+
+```
+55 AA 00 34 00 02 0B 00 40
+```
+
 ---
 
 ## Commands — MCU → ESP (we receive)
 
 ### CMD 0x00 — Heartbeat
 
-The MCU sends this periodically to keep the connection alive. We reply immediately with the heartbeat reply frame above.
+Sent approximately every 250ms. Status byte `0x00` on first heartbeat after power-on, `0x01` thereafter. We reply immediately with the heartbeat reply frame.
 
 ```
-MCU → 55 AA 03 00 00 01 [status] [checksum]
+55 AA 03 00 00 01 [status] [checksum]
 ```
 
 ### CMD 0x01 — Product info
 
-The MCU sends its product ID string after the product info query. No reply required. Logged at DEBUG level.
+The MCU sends its product ID string (JSON payload) in response to our product info query. Sets `mcu_connected = true`. Logged at DEBUG level.
 
 ### CMD 0x02 — MCU state report
 
-Sent in response to our state query during handshake. Contains a dump of all current DP values. No reply required. Logged at DEBUG level.
+Sent in response to our state query during handshake. On this board the payload is always empty (0 bytes) — the MCU sends its actual state via separate CMD 0x07 DP frames immediately after.
 
 ### CMD 0x03 — WiFi status query
 
-The MCU sends this after a reconnect to ask the Wi-Fi module to resend its WiFi status. We reply with the same cloud-connected frame used in the handshake. Observed in the log immediately after MQTT reconnects.
+The MCU asks us to resend our WiFi status. We reply with the cloud-connected frame.
 
 ```
 MCU  → 55 AA 03 03 00 00 ...
-ESP  → 55 AA 00 03 00 01 04 07   (cloud connected)
+ESP  → 55 AA 00 03 00 01 04 07
 ```
 
 ### CMD 0x07 — DP status report
 
-The main status update frame. Sent whenever a DP value changes, and also periodically as a keepalive. Payload structure:
+The main status update frame. Sent whenever a DP value changes, and periodically as a keepalive. Payload structure:
 
 ```
 [DP_ID] [DP_TYPE] [VAL_LEN_HI] [VAL_LEN_LO] [VALUE...]
@@ -227,10 +283,30 @@ DPs we act on:
 
 | DP ID | Name | Values | Action |
 |-------|------|--------|--------|
-| DP4 `0x04` | Feeding motor state | `0x00` = idle/done, `0x01` = scheduled, `0x02` = feeding | `0x00` while `feeding_active` → set feeder sensor to Idle |
-| DP25 `0x19` | Physical lock button | `0x00` = unlocked, `0x01` = locked | Update lock sensor state |
+| DP3 `0x03` | Feed trigger echo | 4-byte int = portions | Logged — confirms MCU received feed command |
+| DP4 `0x04` | Motor state | `0x00`=idle, `0x01`=starting, `0x02`=feeding | `0x00` while `feeding_active` → Idle. `0x00` during startup → `mcu_ready=true` |
+| DP25 `0x19` | Lock state | `0x00`=unlocked, `0x01`=locked | Update lock sensor. Auto-locks 5s after button press |
 
-Other DPs are logged but not acted on. Note: DP4 fires periodically as a keepalive even when not feeding — the `feeding_active` guard prevents false Idle transitions.
+**Confirmed WiFi feed sequence from capture:**
+```
+MCU → DP3=N echo       (confirms command received)
+MCU → DP4=0x01         (motor starting)
+MCU → CMD34 DP11       (feed log with timestamp)
+MCU → DP4=0x02         (motor feeding)
+MCU → DP4=0x00         (motor done)
+```
+
+**Confirmed physical button feed sequence from capture:**
+```
+MCU → DP25=0x00        (button unlocked)
+MCU → DP4=0x01         (motor starting)
+MCU → CMD34 DP11       (feed log)
+MCU → DP4=0x02         (motor feeding)
+MCU → DP4=0x00         (motor done)
+MCU → DP25=0x01        (auto-locked after 5s)
+```
+
+Note: physical button press does not generate a DP3 echo — DP3 is only echoed for UART-triggered feeds.
 
 ### CMD 0x08 — Functional test ack
 
@@ -238,28 +314,19 @@ The MCU acknowledges our CMD 0x08 sent during handshake. No action required. Log
 
 ### CMD 0x1C — Time sync request
 
-The MCU sends CMD 0x1C every second to request the current Unix timestamp. We respond with CMD 0x1C back (same command number, ESP→MCU direction) containing the current UTC time from SNTP. If SNTP has not yet synced, a zeroed timestamp is sent and the MCU will retry on the next request.
+The MCU sends this every second to request the current Unix timestamp. Payload is empty (`55 AA 03 1C 00 00 1E`). We respond with CMD 0x1C containing current UTC time from SNTP. Logged at VERBOSE level only.
 
 ### CMD 0x34 — Extended feeding log
 
-Sent by the MCU after a feed cycle completes. Contains a DP11 record with a timestamp of the feeding event for the MCU's internal log.
+Sent by the MCU after every feed cycle (both UART-triggered and physical button). Contains a DP11 record with a timestamp and portion count.
 
-Used as the **primary feeding-done signal**: CMD 0x34 DP11 (`0x0B`) clears `feeding_active` and sets the feeder sensor to Idle. CMD 0x07 DP4=0x00 serves as a secondary confirmation that also arrives shortly after.
-
----
-
-## Notes on time sync
-
-The MCU sends this command periodically to request the current Unix timestamp so it can timestamp feed events in its internal log.
-
-The time sync command is CMD 0x1C in both directions — the MCU sends it as a request and the ESP responds with the same command containing the current Unix timestamp. The original WBR3 protocol documentation labels this as CMD 0x14 (request) / CMD 0x1C (response), but on this feeder board the MCU uses CMD 0x1C for both request and response.
-
-The firmware responds with UTC Unix time and zero hour/minute offsets. SNTP servers `pool.ntp.org` and `time.google.com` are used. Timezone is set to `Europe/Stockholm` in the config — adjust as needed.
-
-The response frame format is:
 ```
-55 AA 00 1C 00 08 [4-byte unix time, big-endian] [hour offset] [minute offset] [checksum]
+55 AA 03 34 00 11 0B 01 [year_lo] [month] [day] [hour] [min] [sec] [type] [len_hi] [len_lo] [portions] [checksum]
 ```
+
+Used as the **primary feeding-done signal** — clears `feeding_active` and sets feeder sensor to Idle. CMD 0x07 DP4=0x00 serves as secondary confirmation.
+
+After receiving CMD 0x34 from the MCU, the firmware sends the CMD 0x34 ack back. Note that the WBR3 sends this ack proactively after CMD 0x06, so the ack is sent twice per feed cycle in total.
 
 ---
 
@@ -267,12 +334,12 @@ The response frame format is:
 
 | DP | Name | Direction | Type | Notes |
 |----|------|-----------|------|-------|
-| DP3  `0x03` | Feed trigger | ESP → MCU | integer | Number of portions to dispense |
-| DP4  `0x04` | Motor state  | MCU → ESP | enum | 0=idle, 1=scheduled, 2=feeding |
-| DP10 `0x0A` | Unknown | MCU → ESP | 4-byte int | Fires once per feed cycle and every 60s as keepalive; value is consistently `100` — purpose unknown, possibly food level or a timer |
-| DP11 `0x0B` | Feed log     | MCU → ESP | —    | Appears in CMD 0x34 extended report |
-| DP14 `0x0E` | Unknown      | MCU → ESP | —    | Observed in captures, purpose unknown |
-| DP25 `0x19` | Lock state   | MCU → ESP | bool | Physical lock button on feeder |
+| DP3  `0x03` | Feed trigger | ESP → MCU | integer | Portions to dispense. MCU echoes this back on UART feeds |
+| DP4  `0x04` | Motor state  | MCU → ESP | enum | 0=idle, 1=starting, 2=feeding. Sequence: 1→CMD34→2→0 |
+| DP10 `0x0A` | Unknown | MCU → ESP | 4-byte int | Value always `100`. Fires once per feed and every ~60s as keepalive |
+| DP11 `0x0B` | Feed log | MCU → ESP | — | Appears in CMD 0x34. Contains timestamp and portion count |
+| DP14 `0x0E` | Unknown | MCU → ESP | type=0x05 | Always `0x00`. Sent in startup dump only |
+| DP25 `0x19` | Lock state | MCU → ESP | bool | Physical lock button. 0=unlocked, 1=locked. Auto-locks 5s after press |
 
 ---
 
@@ -312,13 +379,13 @@ ESPHome publishes MQTT discovery messages automatically to `homeassistant/sensor
 | Portion Size | Number | `wifi2mqtt/pet-feeder/number/portion_size/state` |
 | Dispense Meal | Button | `wifi2mqtt/pet-feeder/button/dispense_meal/command` |
 
-The `state_topic` for each sensor is explicitly set in the firmware to match the clean topic paths above, ensuring the discovery config and state publishes use the same topic.
+The `state_topic` for each sensor is explicitly set in the firmware to match the clean topic paths above, ensuring discovery config and state publishes always use the same topic.
 
 ### Topic notes
 
 - All state topics use `retain: true` so Home Assistant always has the last known state after a restart.
-- `availability` uses the MQTT LWT (Last Will and Testament) mechanism — the broker automatically publishes `offline` if the device disconnects unexpectedly.
-- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is only set on a 30-second timeout with no MCU response.
+- `availability` uses the MQTT LWT mechanism — the broker automatically publishes `offline` on unexpected disconnect.
+- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is only set on a 30-second timeout.
 
 ---
 
@@ -326,6 +393,9 @@ The `state_topic` for each sensor is explicitly set in the firmware to match the
 
 ```
 MQTT connect
+     │
+     ▼
+  [wait mcu_ready] ── 15s timeout ──► [Error]
      │
      ▼
    [Idle] ◄──────────────────────────────────────────┐
@@ -342,10 +412,30 @@ MQTT connect
      └── 30s timeout — no done signal received
            │
            ▼
-        [Error]
+        [Error] → handshake reset
 ```
 
-`Idle` is set exclusively by the MCU via CMD34 DP11 or CMD07 DP4=0x00 — the feed script only sets `Error` on timeout.
+`Idle` is set exclusively by the MCU — the feed script only sets `Error` on timeout.
+
+---
+
+## Known MCU Behaviour
+
+### ~22h UART communication issue
+
+After approximately 22 hours of continuous UART communication the MCU enters a state where it silently ignores CMD 0x06 feed commands — heartbeats and keepalives continue normally but feed commands receive no response. The physical button continues to work as it bypasses UART entirely.
+
+**Root cause:** The original WBR3 sends a CMD 0x34 DP11 ack immediately after every CMD 0x06, before the MCU has responded. Without this proactive ack the MCU accumulates an unacknowledged feed state that eventually causes it to stop accepting new commands.
+
+**Fix:** The firmware now sends the CMD34 ack immediately after CMD 0x06, matching the WBR3 behaviour confirmed from logic analyser captures. A daily 04:00 reboot with EN LOW acts as a safety net.
+
+### Motor controller initialisation delay
+
+After a full power cycle, the MCU responds to the handshake (CMD01) quickly but the motor controller takes 1–2 additional seconds to initialise. Sending a feed command before the motor controller is ready results in a silent ignore. The firmware tracks `mcu_ready` separately from `mcu_connected` and waits for DP4=0x00 in the startup dump before allowing feed commands.
+
+### Physical button lock behaviour
+
+The physical lock button only disables the buttons on the feeder body. UART feed commands are accepted regardless of lock state — the lock does not block remote feeding.
 
 ---
 
@@ -353,30 +443,29 @@ MQTT connect
 
 ### MQTT debug messages
 
-Set `mqtt_debug: "true"` in the substitutions at the top of the YAML. This publishes diagnostic messages for every significant UART frame to `wifi2mqtt/pet-feeder/debug`. Events covered: feed frame sent, CMD07 DP values, CMD34 extended report, CMD14 time sync, and any unknown commands received. Set back to `"false"` for normal operation.
+Set `mqtt_debug: "true"` in the substitutions at the top of the YAML. This publishes diagnostic messages to `wifi2mqtt/pet-feeder/debug`. Set back to `"false"` for normal operation.
 
 ### Serial log verbosity
 
-The `logger` component controls what appears in the ESPHome serial console (and the ESPHome dashboard log viewer). Change the level in the YAML:
-
 ```yaml
 logger:
-  level: DEBUG    # normal — shows feeding events, DP changes, handshake
-  level: VERBOSE  # maximum — shows every heartbeat, CMD08 ack, CMD1C ack
+  level: DEBUG    # normal — feeding events, DP changes, handshake
+  level: VERBOSE  # maximum — every heartbeat, CMD08 ack, CMD1C time sync
 ```
-
-Available levels from quietest to loudest: `ERROR`, `WARN`, `INFO`, `DEBUG`, `VERBOSE`.
 
 ### Common error states
 
 **Feeder stuck on "Feeding" / feed button does nothing after one use:**
-The `feed_script` runs in `mode: single` — it cannot be triggered again while already running. If the script timed out or errored, check that `feeding_active` was cleared. A reboot will always reset the state.
+The `feed_script` runs in `mode: single`. If the script timed out, a reboot will reset the state.
+
+**"MCU not ready" error immediately after power cycle:**
+The motor controller hasn't finished initialising. The script waits up to 15s — if this appears consistently, check that the MCU is receiving power and the EN pin wiring is correct.
 
 **CMD1C time sync spam at VERBOSE level:**
-The MCU sends CMD 0x1C every second requesting a time sync. This is handled and logged at VERBOSE level only — invisible at normal DEBUG level.
+Normal — the MCU requests time sync every second. Silent at DEBUG level.
 
 **MCU not connecting / handshake not completing:**
-The handshake fires directly from `on_connect`. If `mcu_connected` never becomes true, the **5-second retry interval** will re-fire the handshake automatically. Check the log for `CMD01 product info received` — that's the confirmation the MCU received the handshake. If it never appears, check GPIO10 (EN pin) wiring.
+Check the log for `CMD01 product info received`. If absent, check GPIO10 (EN pin) wiring. The 5-second retry interval will keep retrying automatically.
 
 ---
 
@@ -390,8 +479,6 @@ substitutions:
   topic_prefix: wifi2mqtt/pet-feeder
   mqtt_debug: "false"   # change to "true" for MQTT debug messages
 ```
-
-Setting `mqtt_debug: "true"` publishes diagnostic messages for every significant UART frame to `wifi2mqtt/pet-feeder/debug`. Keep it `"false"` in normal operation to avoid MQTT spam.
 
 Secrets required in `secrets.yaml`:
 
