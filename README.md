@@ -349,7 +349,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 | `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
 | `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
 | `ip` | no | IP address string | Device IP address, updated on change |
-| `debug` | no | text | Serial log mirror — published when `mqtt_debug` is set to the topic string |
+| `debug` | no | text | Serial log mirror — published when `logger: mqtt_topic:` is configured |
 
 ### Command topics (HA → ESP)
 
@@ -451,9 +451,17 @@ The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local 
 
 ## Debugging
 
-### MQTT log 
-https://esphome.io/components/logger/ 
-The logger component automatically logs all log messages through the serial port and through MQTT topics (if there is an MQTT client in the configuration). By default, all logs with a severity DEBUG or higher will be shown. Increasing the log level severity (to e.g INFO or WARN ) can help with the performance of the application and memory size.
+### MQTT log mirror
+
+ESPHome's `logger` component can mirror the serial log to an MQTT topic automatically — no custom code required. Add `mqtt_topic:` to the `logger:` block:
+
+```yaml
+logger:
+  level: DEBUG
+  mqtt_topic: wifi2mqtt/pet-feeder/debug
+```
+
+Whatever passes the configured `level` filter appears on both serial and MQTT. Remove `mqtt_topic:` (or set it to an empty string) to disable. See the [ESPHome logger docs](https://esphome.io/components/logger/) for details.
 
 ### Serial log verbosity
 
@@ -515,7 +523,6 @@ At the top of `pet-feeder.yaml`:
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
-  mqtt_debug: ""   # set to "wifi2mqtt/pet-feeder/debug" to mirror serial log to MQTT
 ```
 
 Secrets required in `secrets.yaml`:
