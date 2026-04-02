@@ -25,6 +25,7 @@ The original WBR3 Wi-Fi module is physically removed and replaced by an ESP32-C3
 | Pin EN   | GPIO10   | ESP → MCU | Module ready signal |
 
 The ESP32-C3 Super Mini is used here, but any ESP32 board will work — just update the GPIO pin numbers in the YAML to match your board's pinout.
+---> I noticed that the U2 component is an LDO (Low-Dropout Regulator). It could be that it not enough power wise for the ESP32 C3. So I connected the board directlly to the v5 volatge rail. This works better.
 
 <img width="475" height="380" alt="image" src="https://github.com/user-attachments/assets/bdd40574-5195-4e42-89a1-cfb5a307780d" />
 
