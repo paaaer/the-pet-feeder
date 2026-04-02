@@ -348,7 +348,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 | `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
 | `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
 | `ip` | no | IP address string | Device IP address, updated on change |
-| `debug` | no | text | UART debug messages — only published when `mqtt_debug: "true"` |
+| `debug` | no | text | Serial log mirror — published when `mqtt_debug` is set to the topic string |
 
 ### Command topics (HA → ESP)
 
@@ -450,15 +450,42 @@ The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local 
 
 ## Debugging
 
-### MQTT debug messages
-
-Set `mqtt_debug: "true"` in the substitutions at the top of the YAML. This publishes diagnostic messages to `wifi2mqtt/pet-feeder/debug`. Set back to `"false"` for normal operation.
+### MQTT log 
+https://esphome.io/components/logger/ 
+The logger component automatically logs all log messages through the serial port and through MQTT topics (if there is an MQTT client in the configuration). By default, all logs with a severity DEBUG or higher will be shown. Increasing the log level severity (to e.g INFO or WARN ) can help with the performance of the application and memory size.
 
 ### Serial log verbosity
+
+Set `level` in the `logger:` block in `pet-feeder.yaml`:
+
 ```yaml
 logger:
-  level: DEBUG    # normal — feeding events, DP changes, handshake
-  level: VERBOSE  # maximum — every heartbeat, CMD08 ack, CMD1C time sync
+  level: WARN     # quiet   — only warnings and errors
+  level: INFO     # normal  — key lifecycle events and feeding activity
+  level: DEBUG    # verbose — full protocol detail, all frames
+  level: VERBOSE  # maximum — every heartbeat, ack frame, CMD1C time sync
+```
+
+Pick one. What each level shows:
+
+| Level | What you see |
+|-------|-------------|
+| `WARN` | Feed blocked/timeout, MCU not connected retries, unknown commands |
+| `INFO` | Boot/handshake milestones, MCU connected/ready, SNTP synced, feed sent, motor starting, feeding done |
+| `DEBUG` | Everything above + every CMD07 DP report, CMD02/CMD03 detail, lock raw state, handshake frame-by-frame |
+| `VERBOSE` | Everything above + every heartbeat, every CMD34/CMD06 ack frame, CMD1C time sync |
+
+**INFO output for a normal feed cycle:**
+```
+[I] Boot: EN LOW
+[I] EN pin HIGH — starting handshake
+[I] MCU connected
+[I] MCU ready — motor controller initialised
+[I] SNTP time synchronised
+[I] Feed sent: 2 portions
+[I] MCU echoed feed: 2 portions
+[I] Motor starting
+[I] Feeding done — CMD34 DP11
 ```
 
 ### Common error states
@@ -487,7 +514,7 @@ At the top of `pet-feeder.yaml`:
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
-  mqtt_debug: "false"   # change to "true" for MQTT debug messages
+  mqtt_debug: ""   # set to "wifi2mqtt/pet-feeder/debug" to mirror serial log to MQTT
 ```
 
 Secrets required in `secrets.yaml`:
