@@ -1,10 +1,10 @@
-# ── DEBUG FLAG ────────────────────────────────────────────────────────────────
-# Set mqtt_debug to "true" to publish debug messages to wifi2mqtt/pet-feeder/debug
-# Set to "false" for normal operation to avoid MQTT spam
+# ── MQTT LOG MIRROR ───────────────────────────────────────────────────────────
+# Set mqtt_debug to "wifi2mqtt/pet-feeder/debug" to mirror the serial log to MQTT.
+# Set to "" (empty string) to disable. Mirrors whatever logger: level: is set to.
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
-  mqtt_debug: "false"   # ← change to "true" to enable MQTT debug messages
+  mqtt_debug: ""   # ← set to "wifi2mqtt/pet-feeder/debug" to enable MQTT log mirror
 
 esphome:
   name: ${device_name}
@@ -30,6 +30,7 @@ esp32:
 
 logger:
   level: DEBUG
+  mqtt_topic: ${mqtt_debug}   # mirrors serial log to MQTT when non-empty
 
 time:
   - platform: sntp
@@ -329,12 +330,6 @@ script:
           uint8_t ack[] = {0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0B, 0x00, 0x40};
           id(tuya_uart).write_array(ack, sizeof(ack));
           ESP_LOGV("tuya", "CMD34 DP11 ack sent (proactive, after CMD06)");
-          if ("${mqtt_debug}" == std::string("true")) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Feed sent: %d portions checksum=0x%02X", n, checksum);
-            mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"),
-                                              std::string(msg), 0, false);
-          }
       # Wait for RX poll to clear feeding_active. Exits immediately when done.
       # 30s timeout — normal feeds complete in ~14s.
       - wait_until:
@@ -423,9 +418,6 @@ interval:
 
             // ── CMD 0x01 Product info from MCU ──────────────────────────
             if (cmd == 0x01) {
-              if ("${mqtt_debug}" == std::string("true"))
-                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"),
-                                                  std::string("CMD01 product info received"), 0, false);
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
               id(mcu_connected) = true;
               id(mcu_sensor).publish_state("Connected");
@@ -452,9 +444,6 @@ interval:
                 }
                 pos += 4 + dp_len;
               }
-              if ("${mqtt_debug}" == std::string("true"))
-                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"),
-                                                  std::string("CMD02 MCU state report parsed"), 0, false);
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -480,17 +469,6 @@ interval:
                            ((uint32_t)buf[12] <<  8) |  (uint32_t)buf[13];
               }
 
-              if ("${mqtt_debug}" == std::string("true")) {
-                char msg[72];
-                if (dp_type == 0x02 && val_len == 4)
-                  snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val32=%u",
-                           dp_id, dp_type, dp_val32);
-                else
-                  snprintf(msg, sizeof(msg), "CMD07 DP%d type=0x%02X val=0x%02X",
-                           dp_id, dp_type, dp_val);
-                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"),
-                                                  std::string(msg), 0, false);
-              }
               if (dp_type == 0x02 && val_len == 4)
                 ESP_LOGD("tuya", "CMD07 DP%d type=0x%02X val32=%u", dp_id, dp_type, dp_val32);
               else
@@ -587,12 +565,6 @@ interval:
             // ── CMD 0x34 Extended feeding log ────────────────────────────
             if (cmd == 0x34 && payload_len >= 2) {
               uint8_t dp_id = buf[6];
-              if ("${mqtt_debug}" == std::string("true")) {
-                char msg[48];
-                snprintf(msg, sizeof(msg), "CMD34 DP%d extended report", dp_id);
-                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"),
-                                                  std::string(msg), 0, false);
-              }
               ESP_LOGD("tuya", "CMD34 DP%d extended report", dp_id);
               if (dp_id == 0x0B && id(feeding_active)) {
                 id(feeding_active) = false;
@@ -608,12 +580,6 @@ interval:
             }
 
             // ── Unknown ──────────────────────────────────────────────────
-            if ("${mqtt_debug}" == std::string("true")) {
-              char msg[48];
-              snprintf(msg, sizeof(msg), "Unknown CMD 0x%02X len=%d", cmd, payload_len);
-              mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"),
-                                                std::string(msg), 0, false);
-            }
             ESP_LOGW("tuya", "Unknown CMD 0x%02X len=%d", cmd, payload_len);
             buf.erase(buf.begin(), buf.begin() + full_len);
           }

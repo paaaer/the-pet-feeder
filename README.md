@@ -348,7 +348,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 | `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
 | `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
 | `ip` | no | IP address string | Device IP address, updated on change |
-| `debug` | no | text | UART debug messages — only published when `mqtt_debug: "true"` |
+| `debug` | no | text | Serial log mirror — published when `mqtt_debug` is set to the topic string |
 
 ### Command topics (HA → ESP)
 
@@ -450,9 +450,16 @@ The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local 
 
 ## Debugging
 
-### MQTT debug messages
+### MQTT log mirror
 
-Set `mqtt_debug: "true"` in the substitutions at the top of the YAML. This publishes diagnostic messages to `wifi2mqtt/pet-feeder/debug`. Set back to `"false"` for normal operation.
+Set `mqtt_debug` in the substitutions to the debug topic to mirror the serial log to MQTT:
+
+```yaml
+mqtt_debug: "wifi2mqtt/pet-feeder/debug"   # enable
+mqtt_debug: ""                              # disable (default)
+```
+
+This uses ESPHome's native `logger: mqtt_topic:` feature — it forwards every log message that passes the configured `logger: level:` filter to the MQTT topic. No separate message list; whatever you see on serial you also get on MQTT. Set back to `""` for normal operation.
 
 ### Serial log verbosity
 
@@ -514,7 +521,7 @@ At the top of `pet-feeder.yaml`:
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
-  mqtt_debug: "false"   # change to "true" for MQTT debug messages
+  mqtt_debug: ""   # set to "wifi2mqtt/pet-feeder/debug" to mirror serial log to MQTT
 ```
 
 Secrets required in `secrets.yaml`:
