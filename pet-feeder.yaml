@@ -46,7 +46,7 @@ time:
 
 ota:
   - platform: esphome
-    password: "e65a575ea5facec072c4c02ee4195dd6"
+    password: !secret ota_pet_feeder_password
 
 wifi:
   networks:
