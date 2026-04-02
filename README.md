@@ -260,7 +260,7 @@ DPs we act on:
 |-------|------|--------|--------|
 | DP3 `0x03` | Feed trigger echo | 4-byte int = portions | Logged — confirms MCU received feed command |
 | DP4 `0x04` | Motor state | `0x00`=idle, `0x01`=starting, `0x02`=feeding | `0x00` while `feeding_active` → Idle. `0x00` during startup → `mcu_ready=true` |
-| DP25 `0x19` | Lock state | `0x00`=unlocked, `0x01`=locked | Update lock sensor. If locked mid-feed, cancel immediately |
+| DP25 `0x19` | Lock state | `0x00`=unlocked, `0x01`=locked | Update lock sensor only. Does not affect UART feeds |
 
 **Confirmed WiFi feed sequence from capture:**
 ```
@@ -313,7 +313,7 @@ After receiving CMD 0x34 from the MCU, the firmware sends the CMD 0x34 ack back.
 | DP10 `0x0A` | Unknown | MCU → ESP | 4-byte int | Value always `100`. Fires once per feed and every ~60s as keepalive |
 | DP11 `0x0B` | Feed log | MCU → ESP | — | Appears in CMD 0x34. Contains timestamp and portion count |
 | DP14 `0x0E` | Unknown | MCU → ESP | type=0x05 | Always `0x00`. Sent in startup dump only |
-| DP25 `0x19` | Lock state | MCU → ESP | bool | Physical lock button. 0=unlocked, 1=locked. Auto-locks 5s after press |
+| DP25 `0x19` | Lock state | MCU → ESP | bool | Physical lock button. 0=unlocked, 1=locked. Auto-locks 5s after press. Does not block UART feeds |
 
 ---
 
@@ -328,7 +328,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 | `availability` | yes | `online` / `offline` | LWT — broker sets `offline` on disconnect, firmware sets `online` on connect |
 | `feeder` | yes | `Idle` / `Feeding` / `Error` | Feeder motor state. Set by MCU responses — never by a timer |
 | `mcu` | yes | `Connected` / `Disconnected` | MCU handshake state |
-| `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body |
+| `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
 | `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
 | `ip` | no | IP address string | Device IP address, updated on change |
 | `debug` | no | text | UART debug messages — only published when `mqtt_debug: "true"` |
@@ -359,7 +359,7 @@ The `state_topic` for each sensor is explicitly set in the firmware to match the
 
 - All state topics use `retain: true` so Home Assistant always has the last known state after a restart.
 - `availability` uses the MQTT LWT mechanism — the broker automatically publishes `offline` on unexpected disconnect.
-- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is only set on a 30-second timeout or physical interruption.
+- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is set on 30-second timeout or cooldown block.
 
 ---
 
@@ -374,6 +374,7 @@ MQTT connect
    [Idle] ◄──────────────────────────────────────────┐
      │                                                │
      │  feedCmd received / Dispense button pressed    │
+     ├── cooldown active (<30s since last) ──────────► [Error] (immediate)
      ▼                                                │
  [Feeding]                                            │
      │                                                │
@@ -382,33 +383,35 @@ MQTT connect
      │
      │  wait_until feeding_active=false (max 30s)
      │
-     ├── Physical lock pressed mid-feed ──────────────► [Error] (immediate)
-     │
      └── 30s timeout — no done signal received
            │
            ▼
         [Error] → handshake reset
 ```
 
-`Idle` is set exclusively by the MCU. `Error` is set on timeout or physical interruption.
+`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block.
 
 ---
 
 ## Feed Guards
 
-The feed script checks three conditions before sending a feed command, in order:
+The feed script checks two conditions before sending a feed command, in order:
 
-1. **Locked guard** — if the physical lock button is active, the feed is blocked immediately. The lock only affects the physical buttons on the feeder body, not UART commands, but blocking here prevents accidental double-feeds when someone is physically interacting with the feeder.
+1. **Cooldown guard** — a 30-second cooldown is enforced between feeds. This prevents rapid re-triggers from HA automations and gives the MCU time to fully complete a feed cycle before the next one begins. If blocked, feeder status is set to `Error` and the script stops immediately.
 
-2. **Cooldown guard** — a 30-second cooldown is enforced between feeds. This prevents rapid re-triggers from HA automations and gives the MCU time to fully complete a feed cycle before the next one begins.
+2. **MCU ready guard** — waits up to 15 seconds for `mcu_ready` (DP4=0x00 received in startup dump). This prevents silent ignores on feeds triggered immediately after a power cycle before the motor controller has initialised. If the timeout expires without `mcu_ready`, feeder status is set to `Error` and the script stops.
 
-3. **MCU ready guard** — waits up to 15 seconds for `mcu_ready` (DP4=0x00 received in startup dump). This prevents silent ignores on feeds triggered immediately after a power cycle before the motor controller has initialised.
+If either guard blocks, no feed frame is sent.
 
-If any guard blocks, the feeder status is set to `Error` and the script stops. No feed frame is sent.
+Note: the physical lock button state is tracked for display purposes but has no effect on remote feeding — the lock only disables the physical buttons on the feeder body.
 
 ---
 
 ## Known MCU Behaviour
+
+### CMD34 ack requirement
+
+The original WBR3 sends a CMD 0x34 DP11 ack immediately after every CMD 0x06, before the MCU has responded. Without this proactive ack the MCU may silently ignore feed commands after extended uptime. The firmware replicates this behaviour exactly, confirmed from logic analyser captures. Two CMD34 acks are also sent during the handshake to clear any pending state.
 
 ### Motor controller initialisation delay
 
@@ -416,11 +419,7 @@ After a full power cycle, the MCU responds to the handshake (CMD01) quickly but 
 
 ### Physical button lock behaviour
 
-The physical lock button only disables the buttons on the feeder body. UART feed commands are accepted regardless of lock state — the lock does not block remote feeding. However if the physical button is pressed while a UART feed is in progress, the MCU may interrupt the feed cycle. The firmware detects this (DP25 going locked while `feeding_active` is true) and immediately cancels the feed rather than waiting for the 30-second timeout.
-
-### CMD34 ack requirement
-
-The original WBR3 sends a CMD 0x34 DP11 ack immediately after every CMD 0x06, before the MCU has responded. Without this proactive ack the MCU may silently ignore feed commands. The firmware replicates this behaviour exactly. Two CMD34 acks are also sent during the handshake to clear any pending state.
+The physical lock button only disables the buttons on the feeder body. UART feed commands are accepted regardless of lock state — the lock does not block remote feeding.
 
 ---
 
@@ -445,7 +444,7 @@ The `feed_script` runs in `mode: single`. If the script timed out, a reboot will
 **"MCU not ready" error immediately after power cycle:**
 The motor controller hasn't finished initialising. The script waits up to 15s — if this appears consistently, check that the MCU is receiving power and the EN pin wiring is correct.
 
-**"Feed blocked — cooldown" error:**
+**"Feed blocked — cooldown" in logs / feeder shows Error:**
 A feed was attempted within 30 seconds of the previous one. Wait and retry.
 
 **CMD1C time sync spam at VERBOSE level:**
