@@ -455,10 +455,37 @@ The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local 
 Set `mqtt_debug: "true"` in the substitutions at the top of the YAML. This publishes diagnostic messages to `wifi2mqtt/pet-feeder/debug`. Set back to `"false"` for normal operation.
 
 ### Serial log verbosity
+
+Set `level` in the `logger:` block in `pet-feeder.yaml`:
+
 ```yaml
 logger:
-  level: DEBUG    # normal — feeding events, DP changes, handshake
-  level: VERBOSE  # maximum — every heartbeat, CMD08 ack, CMD1C time sync
+  level: WARN     # quiet   — only warnings and errors
+  level: INFO     # normal  — key lifecycle events and feeding activity
+  level: DEBUG    # verbose — full protocol detail, all frames
+  level: VERBOSE  # maximum — every heartbeat, ack frame, CMD1C time sync
+```
+
+Pick one. What each level shows:
+
+| Level | What you see |
+|-------|-------------|
+| `WARN` | Feed blocked/timeout, MCU not connected retries, unknown commands |
+| `INFO` | Boot/handshake milestones, MCU connected/ready, SNTP synced, feed sent, motor starting, feeding done |
+| `DEBUG` | Everything above + every CMD07 DP report, CMD02/CMD03 detail, lock raw state, handshake frame-by-frame |
+| `VERBOSE` | Everything above + every heartbeat, every CMD34/CMD06 ack frame, CMD1C time sync |
+
+**INFO output for a normal feed cycle:**
+```
+[I] Boot: EN LOW
+[I] EN pin HIGH — starting handshake
+[I] MCU connected
+[I] MCU ready — motor controller initialised
+[I] SNTP time synchronised
+[I] Feed sent: 2 portions
+[I] MCU echoed feed: 2 portions
+[I] Motor starting
+[I] Feeding done — CMD34 DP11
 ```
 
 ### Common error states
