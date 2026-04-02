@@ -107,14 +107,17 @@ Power on → on_boot: EN LOW (held)
 ```
 Reboot → on_boot: EN LOW (MCU already running, ignores it)
        → WiFi + MQTT connect
-       → on_connect: EN HIGH (MCU ignores it)
+       → on_connect: EN HIGH (MCU ignores it, already running)
        → 1s delay → handshake fires directly
        → MCU replies CMD01 → mcu_connected = true ✅
-       → MCU sends DP state dump → mcu_ready = true ✅
-       → 5s retry interval keeps retrying if no CMD01 ✅
+       → MCU replies to CMD02 with DP state dump → DP4=0x00 → mcu_ready = true ✅
+       → Feed commands accepted immediately after mcu_ready ✅
+       → 5s retry interval keeps retrying if CMD01 never arrives ✅
 ```
 
-The EN pin on this board is only sampled at MCU power-on. Toggling EN at runtime has no effect on an already-running MCU — the handshake is always fired directly from `on_connect` regardless.
+No special detection of "ESP-only reboot" vs "full power cycle" is needed — the handshake always fires from `on_connect` and the MCU always responds to CMD02 (state query) with a full DP dump regardless of whether it just powered on or was already running. The result is identical from the firmware's perspective.
+
+The EN pin on this board is only sampled at MCU power-on. Driving EN LOW briefly during an ESP reboot has no effect on an already-running MCU.
 
 ### MCU readiness
 
@@ -203,12 +206,26 @@ Sent during handshake. The MCU acknowledges with its own CMD 0x08 frame.
 
 ### CMD 0x1C — Time sync reply
 
-Sent in response to CMD 0x1C from the MCU. Contains the current UTC Unix timestamp from SNTP.
+Sent in response to CMD 0x1C from the MCU. The payload is always **8 bytes** — confirmed from WBR3 logic analyser captures. Sending fewer bytes while declaring `len=8` in the header causes the MCU's frame parser to read past the frame boundary on every response, continuously corrupting the UART stream.
+
 ```
-55 AA 00 1C 00 08 [4-byte unix time, big-endian] [hour offset=0x00] [min offset=0x00] [checksum]
+55 AA 00 1C 00 08 [4-byte UTC unix time, big-endian] [local hour] [local minute] [UTC offset hours] [UTC offset minutes=0x00] [checksum]
 ```
 
-If SNTP has not yet synced, a zeroed frame is sent and the MCU retries on the next request.
+Total frame length: **15 bytes** (6 header + 8 payload + 1 checksum).
+
+| Byte(s) | Field | Description |
+|---------|-------|-------------|
+| `00 08` | Length | Payload is always 8 bytes |
+| `XX XX XX XX` | UTC unix time | Current UTC timestamp, big-endian 32-bit |
+| `XX` | Local hour | Current local hour (0–23), timezone-adjusted |
+| `XX` | Local minute | Current local minute (0–59) |
+| `XX` | UTC offset hours | Hours east of UTC (e.g. `0x01`=CET, `0x02`=CEST) |
+| `0x00` | UTC offset minutes | Always `0x00` for Stockholm |
+
+The UTC offset is derived at runtime from the difference between the SNTP-synced local time and UTC, so CET (+1) and CEST (+2) are handled automatically.
+
+If SNTP has not yet synced, a zeroed 8-byte payload is sent (`55 AA 00 1C 00 08 00 00 00 00 00 00 00 00 23`) and the MCU retries on the next request.
 
 ### CMD 0x34 — Feed acknowledgement
 
@@ -289,7 +306,7 @@ The MCU acknowledges our CMD 0x08 sent during handshake. No action required. Log
 
 ### CMD 0x1C — Time sync request
 
-The MCU sends this every second to request the current Unix timestamp. Payload is empty (`55 AA 03 1C 00 00 1E`). We respond with CMD 0x1C containing current UTC time from SNTP. Logged at VERBOSE level only.
+The MCU sends this every second to request the current Unix timestamp. Payload is empty (`55 AA 03 1C 00 00 1E`). We respond with CMD 0x1C containing UTC time, local hour/minute, and UTC offset from SNTP. Logged at VERBOSE level only — log line includes `unix=`, `local=HH:MM`, and `tz=+N`.
 
 ### CMD 0x34 — Extended feeding log
 
@@ -421,6 +438,14 @@ After a full power cycle, the MCU responds to the handshake (CMD01) quickly but 
 
 The physical lock button only disables the buttons on the feeder body. UART feed commands are accepted regardless of lock state — the lock does not block remote feeding.
 
+### CMD 0x1C payload length — stream corruption bug (fixed)
+
+The MCU sends a time sync request every second. The correct response payload is **8 bytes**, as confirmed by WBR3 logic analyser captures. An earlier version of this firmware declared `len=8` in the frame header but only wrote 6 bytes of payload, producing a 13-byte frame where the MCU expected 15. On every time sync response the MCU consumed 2 bytes from the next UART frame as part of the CMD 0x1C payload, continuously desynchronising the stream.
+
+Because CMD 0x1C fires every second this corruption was permanent and affected every frame that followed — including the CMD01 handshake response, DP status reports, and CMD34 feeding logs. Symptoms were startup failures (handshake never completing, `mcu_ready` never set) and remote feed commands silently failing.
+
+The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local minute] [UTC offset hours] [UTC offset minutes]`, matching the WBR3 exactly.
+
 ---
 
 ## Debugging
@@ -448,7 +473,7 @@ The motor controller hasn't finished initialising. The script waits up to 15s �
 A feed was attempted within 30 seconds of the previous one. Wait and retry.
 
 **CMD1C time sync spam at VERBOSE level:**
-Normal — the MCU requests time sync every second. Silent at DEBUG level.
+Normal — the MCU requests time sync every second. Silent at DEBUG level. Log line format: `CMD1C time sync: unix=NNNN local=HH:MM tz=+N cs=0xXX`.
 
 **MCU not connecting / handshake not completing:**
 Check the log for `CMD01 product info received`. If absent, check GPIO10 (EN pin) wiring. The 5-second retry interval will keep retrying automatically.

@@ -525,23 +525,38 @@ interval:
               auto now = id(sntp_time).now();
               if (now.is_valid()) {
                 uint32_t unix_time = (uint32_t)now.timestamp;
-                uint8_t resp[13] = {
+                // Derive UTC hour and local time fields for the 8-byte payload.
+                // WBR3 capture confirms payload is always 8 bytes:
+                //   [4B UTC unix] [local hour] [local min] [UTC offset hours] [UTC offset minutes]
+                // Sending fewer bytes with len=8 in the header corrupts the MCU's UART
+                // parser — it reads past the frame boundary every second.
+                uint8_t utc_h = (uint8_t)((unix_time / 3600) % 24);
+                uint8_t loc_h = (uint8_t)now.hour;
+                uint8_t loc_m = (uint8_t)now.minute;
+                uint8_t tz_h  = (uint8_t)((loc_h - utc_h + 24) % 24);
+                uint8_t resp[15] = {
                   0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08,
                   (uint8_t)(unix_time >> 24),
                   (uint8_t)(unix_time >> 16),
                   (uint8_t)(unix_time >>  8),
                   (uint8_t)(unix_time),
-                  0x00,
+                  loc_h,
+                  loc_m,
+                  tz_h,
                   0x00,
                   0x00
                 };
                 uint8_t cs = 0;
-                for (int i = 0; i < 12; i++) cs += resp[i];
-                resp[12] = cs;
-                id(tuya_uart).write_array(resp, 13);
-                ESP_LOGV("tuya", "CMD1C time sync: unix=%u cs=0x%02X", unix_time, cs);
+                for (int i = 0; i < 14; i++) cs += resp[i];
+                resp[14] = cs;
+                id(tuya_uart).write_array(resp, 15);
+                ESP_LOGV("tuya", "CMD1C time sync: unix=%u local=%02u:%02u tz=+%u cs=0x%02X",
+                         unix_time, loc_h, loc_m, tz_h, cs);
               } else {
-                uint8_t resp[] = {0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08, 0,0,0,0, 0,0, 0x23};
+                // SNTP not yet synced — send zero payload (all 8 bytes).
+                // Checksum 0x23 = (0x55+0xAA+0x1C+0x08) & 0xFF — unchanged
+                // because the 8 zero payload bytes contribute nothing to the sum.
+                uint8_t resp[] = {0x55, 0xAA, 0x00, 0x1C, 0x00, 0x08, 0,0,0,0, 0,0,0,0, 0x23};
                 id(tuya_uart).write_array(resp, sizeof(resp));
                 ESP_LOGV("tuya", "CMD1C time sync: SNTP not ready, sending zero");
               }
