@@ -37,6 +37,25 @@ time:
     on_time_sync:
       then:
         - logger.log: "SNTP time synchronised"
+    # Preventive ESP32 reboot every day at 04:00.
+    # The MCU enters a state after ~22h of continuous UART communication
+    # where it ignores feed commands. A reboot forces a full re-handshake
+    # which resets the MCU UART state. 04:00 is well clear of both feed
+    # times (06:15 and 17:00) so no feed is ever interrupted.
+    on_time:
+      - hours: 4
+        minutes: 0
+        seconds: 0
+        then:
+          - logger.log: "Scheduled daily reboot at 04:00 — pulling EN LOW to reset MCU"
+          # Pull EN LOW first to reset the MCU completely, not just the UART state.
+          # Hold LOW for 2s to ensure MCU fully powers down before ESP32 reboots.
+          # On reboot, on_boot holds EN LOW, then on_connect drives it HIGH again
+          # giving the MCU a clean rising edge as if it was a full power cycle.
+          - output.turn_off: mcu_en_pin
+          - delay: 2s
+          - lambda: App.safe_reboot();
+
 
 ota:
   - platform: esphome
@@ -94,6 +113,7 @@ mqtt:
       - lambda: |-
           id(mcu_connected) = false;
           id(mcu_heartbeat_seen) = false;
+          id(mcu_ready) = false;
   on_message:
     # Feed command from HA: payload = number of portions (1-12)
     - topic: ${topic_prefix}/feedCmd
@@ -101,6 +121,7 @@ mqtt:
         - script.execute:
             id: feed_script
             portions: !lambda "return atoi(x.c_str());"
+
 
 # ── PIN ASSIGNMENTS (ESP32-C3 Super Mini → WBR3 footprint) ──────────────────
 #
@@ -155,6 +176,14 @@ globals:
   - id: feeder_locked
     type: bool
     restore_value: yes
+    initial_value: 'false'
+
+  - id: mcu_ready
+    # true after MCU sends DP4=0x00 in its startup state dump.
+    # Motor controller is initialised and ready for feed commands.
+    # Cleared on disconnect.
+    type: bool
+    restore_value: no
     initial_value: 'false'
 
 button:
@@ -245,6 +274,12 @@ script:
       - uart.write: [0x55, 0xAA, 0x00, 0x03, 0x00, 0x01, 0x04, 0x07] # WiFi: cloud connected
       - delay: 200ms
       - uart.write: [0x55, 0xAA, 0x00, 0x08, 0x00, 0x00, 0x07]       # CMD 0x08
+      - delay: 200ms
+      # CMD 0x34 DP11 ack — WBR3 sends this twice at startup.
+      # Required to clear any pending feed state in MCU memory.
+      - uart.write: [0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0B, 0x00, 0x40]
+      - delay: 200ms
+      - uart.write: [0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0B, 0x00, 0x40]
       - delay: 500ms
       - logger.log: "Handshake frames sent — waiting for CMD01 confirmation"
 
@@ -257,6 +292,19 @@ script:
       portions: int
     mode: single
     then:
+      # Wait for MCU motor controller to be ready (DP4=0 received in startup dump).
+      # After a full power cycle CMD01 arrives fast but motor init takes longer.
+      - wait_until:
+          condition:
+            lambda: "return id(mcu_ready);"
+          timeout: 15s
+      - if:
+          condition:
+            lambda: "return !id(mcu_ready);"
+          then:
+            - logger.log: "MCU not ready — feed aborted, motor controller not initialised"
+            - lambda: id(feeder_sensor).publish_state("Error");
+            - script.stop: feed_script
       - lambda: id(feeder_sensor).publish_state("Feeding");
       - lambda: |-
           int n = portions;
@@ -272,12 +320,20 @@ script:
           id(tuya_uart).write_array(frame, sizeof(frame));
           id(feeding_active) = true;
           ESP_LOGI("tuya", "Feed frame sent: %d portions checksum=0x%02X", n, checksum);
+          // Send CMD34 DP11 ack immediately after CMD06, exactly as WBR3 does.
+          // WBR3 sends this proactively right after the feed command, NOT after
+          // receiving CMD34 from the MCU. The MCU appears to require this ack
+          // before it will start the motor.
+          uint8_t ack[] = {0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0B, 0x00, 0x40};
+          id(tuya_uart).write_array(ack, sizeof(ack));
+          ESP_LOGD("tuya", "CMD34 DP11 ack sent (proactive, after CMD06)");
           if ("${mqtt_debug}" == std::string("true")) {
             char msg[64];
             snprintf(msg, sizeof(msg), "Feed sent: %d portions checksum=0x%02X", n, checksum);
             mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string(msg), 0, false);
           }
       # Wait for RX poll to clear feeding_active. Exits immediately when done.
+      # 30s timeout — normal feeds complete in ~14s.
       - wait_until:
           condition:
             lambda: "return !id(feeding_active);"
@@ -288,8 +344,10 @@ script:
           then:
             - lambda: |-
                 id(feeding_active) = false;
+                id(mcu_connected) = false;
                 id(feeder_sensor).publish_state("Error");
-            - logger.log: "Feed timeout — no done signal received from MCU"
+            - logger.log: "Feed timeout — no done signal from MCU, running handshake reset"
+            - script.execute: do_handshake
 
 interval:
   - interval: 30s
@@ -377,9 +435,27 @@ interval:
 
             // ── CMD 0x02 MCU state report ────────────────────────────────
             if (cmd == 0x02) {
+              // CMD02 is the MCU's full DP state dump — parse it to get real states
+              // on startup rather than assuming defaults. Same DP structure as CMD07.
+              ESP_LOGD("tuya", "CMD02 MCU state report (%d bytes)", payload_len);
+              uint16_t pos = 6;
+              while (pos + 4 < full_len) {
+                uint8_t dp_id   = buf[pos];
+                uint8_t dp_type = buf[pos+1];
+                uint16_t dp_len = (buf[pos+2] << 8) | buf[pos+3];
+                if (pos + 4 + dp_len > full_len) break;
+                uint8_t dp_val  = buf[pos+4];
+                // DP25 = lock state
+                if (dp_id == 0x19 && dp_len >= 1) {
+                  bool locked = (dp_val == 0x01);
+                  id(feeder_locked) = locked;
+                  id(lock_sensor).publish_state(locked ? "Locked" : "Unlocked");
+                  ESP_LOGD("tuya", "CMD02 lock state: %s", locked ? "LOCKED" : "UNLOCKED");
+                }
+                pos += 4 + dp_len;
+              }
               if ("${mqtt_debug}" == std::string("true"))
-                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string("CMD02 MCU state report"), 0, false);
-              ESP_LOGD("tuya", "CMD02 MCU state report");
+                mqtt::global_mqtt_client->publish(std::string("${topic_prefix}/debug"), std::string("CMD02 MCU state report parsed"), 0, false);
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -423,10 +499,19 @@ interval:
                 ESP_LOGI("tuya", "CMD07 DP%d type=0x%02X val=0x%02X", dp_id, dp_type, dp_val);
 
               // DP4 (0x04) = feeding motor state: 0x00=idle/done
-              if (dp_id == 0x04 && dp_val == 0x00 && id(feeding_active)) {
-                id(feeding_active) = false;
-                id(feeder_sensor).publish_state("Idle");
-                ESP_LOGI("tuya", "Feeding done — DP4=0");
+              if (dp_id == 0x04 && dp_val == 0x00) {
+                if (id(feeding_active)) {
+                  id(feeding_active) = false;
+                  id(feeder_sensor).publish_state("Idle");
+                  ESP_LOGI("tuya", "Feeding done — DP4=0");
+                  uint8_t ack[] = {0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0B, 0x00, 0x40};
+                  id(tuya_uart).write_array(ack, sizeof(ack));
+                  ESP_LOGD("tuya", "CMD34 DP11 ack sent to MCU (DP4 path)");
+                }
+                if (!id(mcu_ready)) {
+                  id(mcu_ready) = true;
+                  ESP_LOGD("tuya", "MCU ready — motor controller initialised (DP4=0)");
+                }
               }
 
               // DP25 (0x19) = lock state from physical button
@@ -495,6 +580,12 @@ interval:
                 id(feeding_active) = false;
                 id(feeder_sensor).publish_state("Idle");
                 ESP_LOGI("tuya", "Feeding done — CMD34 DP11");
+                // Ack the feed completion back to MCU — WBR3 always sends this
+                // after every feed. Without it the MCU may refuse the next
+                // UART feed command after ~24h (requires physical button to wake).
+                uint8_t ack[] = {0x55, 0xAA, 0x00, 0x34, 0x00, 0x02, 0x0B, 0x00, 0x40};
+                id(tuya_uart).write_array(ack, sizeof(ack));
+                ESP_LOGD("tuya", "CMD34 DP11 ack sent to MCU");
               }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
