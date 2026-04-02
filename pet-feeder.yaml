@@ -1,10 +1,6 @@
-# ── MQTT LOG MIRROR ───────────────────────────────────────────────────────────
-# Set mqtt_debug to "wifi2mqtt/pet-feeder/debug" to mirror the serial log to MQTT.
-# Set to "" (empty string) to disable. Mirrors whatever logger: level: is set to.
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
-  mqtt_debug: ""   # ← set to "wifi2mqtt/pet-feeder/debug" to enable MQTT log mirror
 
 esphome:
   name: ${device_name}
@@ -30,7 +26,6 @@ esp32:
 
 logger:
   level: DEBUG
-  mqtt_topic: ${mqtt_debug}   # mirrors serial log to MQTT when non-empty
 
 time:
   - platform: sntp

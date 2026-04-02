@@ -450,16 +450,9 @@ The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local 
 
 ## Debugging
 
-### MQTT log mirror
-
-Set `mqtt_debug` in the substitutions to the debug topic to mirror the serial log to MQTT:
-
-```yaml
-mqtt_debug: "wifi2mqtt/pet-feeder/debug"   # enable
-mqtt_debug: ""                              # disable (default)
-```
-
-This uses ESPHome's native `logger: mqtt_topic:` feature — it forwards every log message that passes the configured `logger: level:` filter to the MQTT topic. No separate message list; whatever you see on serial you also get on MQTT. Set back to `""` for normal operation.
+### MQTT log 
+https://esphome.io/components/logger/ 
+The logger component automatically logs all log messages through the serial port and through MQTT topics (if there is an MQTT client in the configuration). By default, all logs with a severity DEBUG or higher will be shown. Increasing the log level severity (to e.g INFO or WARN ) can help with the performance of the application and memory size.
 
 ### Serial log verbosity
 
