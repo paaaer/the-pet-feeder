@@ -367,7 +367,7 @@ script:
           id(mcu_connected) = false;
           id(mcu_ready) = false;
       - delay: 2s
-      - lambda: 'ESP.restart();'
+      - lambda: 'esp_restart();'
 
   # ── MCU reset and retry ───────────────────────────────────────────────────
   # Called from feed_script timeout path when retries remain.
