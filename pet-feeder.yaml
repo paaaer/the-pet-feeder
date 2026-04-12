@@ -39,6 +39,20 @@ time:
         - logger.log:
             level: INFO
             format: "SNTP time synchronised"
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: /1
+        then:
+          - if:
+              condition:
+                lambda: 'return id(auto_reboot_en).state &&
+                                (int)id(sntp_time).now().hour == (int)id(reboot_hour).state;'
+              then:
+                - logger.log:
+                    level: INFO
+                    format: "Scheduled daily reboot triggered"
+                - script.execute: mcu_reboot
 
 ota:
   - platform: esphome
@@ -178,6 +192,15 @@ globals:
     restore_value: no
     initial_value: '1'
 
+switch:
+  - platform: template
+    name: "Auto Reboot"
+    id: auto_reboot_en
+    icon: "mdi:restart"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+
 button:
   - platform: template
     name: "Dispense Meal"
@@ -191,6 +214,19 @@ button:
             portions: !lambda "return (int)id(portion_size).state;"
 
 number:
+  - platform: template
+    name: "Reboot Hour"
+    id: reboot_hour
+    icon: "mdi:clock-restart"
+    entity_category: config
+    min_value: 0
+    max_value: 23
+    step: 1
+    restore_value: yes
+    initial_value: 3
+    optimistic: true
+    unit_of_measurement: "h"
+
   - platform: template
     name: "Feed Max Retries"
     id: feed_max_retries
@@ -309,6 +345,29 @@ script:
                 id(mcu_ready) = true;
                 id(mcu_sensor).publish_state("Connected");
                 ESP_LOGI("tuya", "MCU ready — assumed idle (no DP4=0 received after 8s)");
+
+  # ── MCU reboot ────────────────────────────────────────────────────────────
+  # Pulls EN LOW for 2s then restarts the ESP32.
+  # The 2s hold lets the MCU fully reset its UART state before the ESP comes
+  # back up. After restart, on_boot holds EN LOW, then on_connect drives it
+  # HIGH again — same clean rising edge as a full power cycle.
+  # Used by the scheduled daily reboot. Can also be called for any hard reset.
+  - id: mcu_reboot
+    mode: single
+    then:
+      - mqtt.publish:
+          topic: ${topic_prefix}/availability
+          payload: "restarting"
+          retain: true
+      - logger.log:
+          level: INFO
+          format: "MCU reboot — EN LOW, restarting in 2s"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_ready) = false;
+      - delay: 2s
+      - lambda: 'ESP.restart();'
 
   # ── MCU reset and retry ───────────────────────────────────────────────────
   # Called from feed_script timeout path when retries remain.

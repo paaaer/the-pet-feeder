@@ -406,7 +406,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 
 | Topic | Retained | Values | Description |
 |-------|----------|--------|-------------|
-| `availability` | yes | `online` / `offline` | LWT — broker sets `offline` on disconnect, firmware sets `online` on connect |
+| `availability` | yes | `online` / `offline` / `restarting` | LWT — broker sets `offline` on disconnect, firmware sets `online` on connect. `restarting` is published just before a scheduled reboot so it can be distinguished from a crash |
 | `feeder` | yes | `Idle` / `Feeding` / `Error` | Feeder motor state. Set by MCU responses — never by a timer |
 | `mcu` | yes | `Disconnected` / `Initialising` / `Connected` | MCU handshake state. `Initialising` = CMD01 received, waiting for motor controller ready |
 | `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
@@ -421,6 +421,8 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 |-------|--------|-------------|
 | `feedCmd` | `1`–`12` | Trigger a feed cycle. Payload is the number of portions to dispense |
 | `number/feed_max_retries/command` | `0`–`5` | Set the number of MCU reset+retry attempts on feed timeout |
+| `switch/auto-reboot/command` | `ON` / `OFF` | Enable or disable the scheduled daily reboot |
+| `number/reboot-hour/command` | `0`–`23` | Hour of day to reboot (local time). Default `3` = 03:00 |
 
 ### Home Assistant discovery
 
@@ -436,6 +438,8 @@ ESPHome publishes MQTT discovery messages automatically to `homeassistant/sensor
 | IP | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/ip` |
 | Portion Size | Number (config) | `wifi2mqtt/pet-feeder/number/portion_size/state` |
 | Feed Max Retries | Number (config) | `wifi2mqtt/pet-feeder/number/feed_max_retries/state` — default 3, range 0–5 |
+| Reboot Hour | Number (config) | `wifi2mqtt/pet-feeder/number/reboot-hour/state` — default 3, range 0–23 |
+| Auto Reboot | Switch (config) | `wifi2mqtt/pet-feeder/switch/auto-reboot/state` — default ON |
 | Dispense Meal | Button | `wifi2mqtt/pet-feeder/button/dispense_meal/command` |
 
 The `state_topic` for each sensor is explicitly set in the firmware to match the clean topic paths above, ensuring discovery config and state publishes always use the same topic.
@@ -537,6 +541,49 @@ Each retry attempt uses the same portion count as the original command. Retries 
 | `Feed Max Retries` | 3 | 0–5 | Number of MCU reset+retry attempts before giving up. Set to `0` to disable retries. |
 
 Configure via MQTT: `wifi2mqtt/pet-feeder/number/feed_max_retries/command` → send `0`–`5`.
+
+---
+
+## Scheduled Daily Reboot
+
+The firmware supports an optional daily reboot at a configurable hour. This keeps the ESP32 fresh over long uptime (WiFi stack, memory) and gives the MCU a clean reset cycle.
+
+### Reboot sequence
+
+```
+on_time fires at configured hour (:00)
+  Auto Reboot switch ON?
+    │
+    ▼
+  availability → "restarting"   ← distinguishes from crash in MQTT logs
+  EN LOW
+  mcu_connected = false, mcu_ready = false
+  2s delay                      ← MCU UART state fully resets
+  ESP.restart()
+    │
+    ▼
+  on_boot: EN stays LOW
+  WiFi + MQTT reconnect
+  on_connect: EN HIGH → do_handshake
+  Normal operation resumes ✓
+```
+
+The EN LOW → 2s → restart pattern is the same used by the feed retry MCU reset (`mcu_reset_and_retry`), extracted into the shared `mcu_reboot` script. A plain `ESP.restart()` without the EN hold is not used — the 2s LOW period is required for the MCU to fully reinitialise its UART state.
+
+After the reboot, `availability` transitions `restarting` → `offline` → `online`. A crash or brownout reboot shows only `offline` → `online` with no `restarting` prefix.
+
+### Configuration
+
+| Entity | Default | Description |
+|--------|---------|-------------|
+| `Auto Reboot` switch | ON | Enable or disable the daily reboot entirely |
+| `Reboot Hour` number | `3` (03:00) | Local hour to reboot. Set well clear of scheduled feed times |
+
+Configure via MQTT:
+- `wifi2mqtt/pet-feeder/switch/auto-reboot/command` → `ON` / `OFF`
+- `wifi2mqtt/pet-feeder/number/reboot-hour/command` → `0`–`23`
+
+Both settings are persisted in flash — survive reboots without reflashing.
 
 ---
 
