@@ -96,6 +96,16 @@ mqtt:
       - lambda: id(feeder_sensor).publish_state("Idle");
       - lambda: id(mcu_sensor).publish_state("Disconnected");
       - lambda: id(lock_sensor).publish_state("Unlocked");
+      # On first boot hold EN LOW until 10s from power-on.
+      # ESP connects WiFi+MQTT in ~5s; MCU needs ~10s to finish booting.
+      # Without this the MCU misses the first EN rising edge.
+      # On MQTT reconnects (first_connect_done=true) EN rises immediately.
+      - if:
+          condition:
+            lambda: "return !id(first_connect_done);"
+          then:
+            - delay: !lambda "return (uint32_t)std::max(0, 10000 - (int)millis());"
+            - lambda: id(first_connect_done) = true;
       - output.turn_on: mcu_en_pin
       - logger.log:
           level: INFO
@@ -191,6 +201,16 @@ globals:
     type: int
     restore_value: no
     initial_value: '1'
+
+  - id: handshake_attempts
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: first_connect_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 switch:
   - platform: template
@@ -345,6 +365,27 @@ script:
                 id(mcu_ready) = true;
                 id(mcu_sensor).publish_state("Connected");
                 ESP_LOGI("tuya", "MCU ready — assumed idle (no DP4=0 received after 8s)");
+
+  # ── EN re-pulse (boot watchdog) ──────────────────────────────────────────
+  # After a full power cycle the MCU takes ~60s to boot, but the ESP drives
+  # EN HIGH in ~5s. The MCU misses the first rising edge and never starts the
+  # handshake. This script re-pulses EN LOW→HIGH to give the MCU a fresh edge
+  # once it is ready. Called from the 5s interval after 60s of no response.
+  - id: en_repulse
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "MCU not responding after 60s — re-pulsing EN for fresh rising edge"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_ready) = false;
+          id(handshake_attempts) = 0;
+      - delay: 2s
+      - output.turn_on: mcu_en_pin
+      - delay: 1s
+      - script.execute: do_handshake
 
   # ── MCU reboot ────────────────────────────────────────────────────────────
   # Pulls EN LOW for 2s then restarts the ESP32.
@@ -560,12 +601,16 @@ script:
                         auto t = id(sntp_time).now();
                         char msg[80];
                         if (t.is_valid())
-                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed failed — all retries exhausted",
+                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed failed — all retries exhausted, rebooting",
                                    t.hour, t.minute, t.second);
                         else
-                          snprintf(msg, sizeof(msg), "Feed failed — all retries exhausted");
+                          snprintf(msg, sizeof(msg), "Feed failed — all retries exhausted, rebooting");
                         return std::string(msg);
                       retain: true
+                  # MCU is unresponsive even after EN cycles — do a full ESP restart
+                  # so the MCU gets a clean 2s EN LOW + proper rising edge on reconnect.
+                  - delay: 500ms
+                  - script.execute: mcu_reboot
 
 interval:
   - interval: 30s
@@ -579,12 +624,23 @@ interval:
     then:
       - if:
           condition:
-            lambda: "return !id(mcu_connected) && !id(do_handshake).is_running();"
+            lambda: |-
+              return !id(mcu_connected)
+                  && !id(do_handshake).is_running()
+                  && !id(mcu_reset_and_retry).is_running()
+                  && !id(en_repulse).is_running();
           then:
-            - logger.log:
-                level: WARN
-                format: "MCU not connected — retrying handshake"
-            - script.execute: do_handshake
+            - lambda: id(handshake_attempts)++;
+            - if:
+                condition:
+                  lambda: "return id(handshake_attempts) >= 12;"  # 60s
+                then:
+                  - script.execute: en_repulse
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "MCU not connected — retrying handshake"
+                  - script.execute: do_handshake
 
   # ── UART RX poll (100ms) ──────────────────────────────────────────────────
   # MCU sends Tuya v3 frames (55 AA 03 ...).
@@ -638,6 +694,7 @@ interval:
             if (cmd == 0x01) {
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
               id(mcu_connected) = true;
+              id(handshake_attempts) = 0;  // stop boot watchdog counter
               if (!id(mcu_ready)) {
                 // Motor controller not yet confirmed — show Initialising and
                 // start fallback timer. If DP4=0x00 arrives first it wins;
