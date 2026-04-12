@@ -420,6 +420,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 | Topic | Values | Description |
 |-------|--------|-------------|
 | `feedCmd` | `1`–`12` | Trigger a feed cycle. Payload is the number of portions to dispense |
+| `number/feed_max_retries/command` | `0`–`5` | Set the number of MCU reset+retry attempts on feed timeout |
 
 ### Home Assistant discovery
 
@@ -433,7 +434,8 @@ ESPHome publishes MQTT discovery messages automatically to `homeassistant/sensor
 | Last Error | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/last_error` |
 | RSSI | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/rssi` |
 | IP | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/ip` |
-| Portion Size | Number | `wifi2mqtt/pet-feeder/number/portion_size/state` |
+| Portion Size | Number (config) | `wifi2mqtt/pet-feeder/number/portion_size/state` |
+| Feed Max Retries | Number (config) | `wifi2mqtt/pet-feeder/number/feed_max_retries/state` — default 3, range 0–5 |
 | Dispense Meal | Button | `wifi2mqtt/pet-feeder/button/dispense_meal/command` |
 
 The `state_topic` for each sensor is explicitly set in the firmware to match the clean topic paths above, ensuring discovery config and state publishes always use the same topic.
@@ -455,25 +457,32 @@ MQTT connect
   [wait mcu_ready] ── 15s timeout ──► [Error]
      │
      ▼
-   [Idle] ◄──────────────────────────────────────────┐
-     │                                                │
-     │  feedCmd received / Dispense button pressed    │
-     ├── cooldown active (<30s since last) ──────────► [Error] (immediate)
-     ▼                                                │
- [Feeding]                                            │
-     │                                                │
-     ├── CMD34 DP11 received ─────────────────────────┤  (primary done signal)
-     ├── CMD07 DP4=0x00 received ────────────────────►┘  (secondary done signal)
+   [Idle] ◄──────────────────────────────────────────────────────┐
+     │                                                            │
+     │  feedCmd received / Dispense button pressed                │
+     ├── cooldown active (<30s since last) ──────────────────► [Error] (immediate)
+     ▼                                                            │
+ [Feeding]                                                        │
+     │                                                            │
+     ├── CMD34 DP11 received ─────────────────────────────────────┤  (primary)
+     ├── CMD07 DP4=0x00 received ────────────────────────────────►┘  (secondary)
      │
      │  wait_until feeding_active=false (max 30s)
      │
-     └── 30s timeout — no done signal received
+     └── 30s timeout — no done signal from MCU
            │
            ▼
-        [Error] → handshake reset
+        [Error]
+           │
+           ├── retries remaining? yes
+           │     → EN LOW → 2s → EN HIGH → do_handshake
+           │     → wait mcu_ready → retry feed ──────────────────► [Feeding]
+           │     (repeats up to Feed Max Retries times)
+           │
+           └── retries exhausted → last_error: "all retries exhausted"
 ```
 
-`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block.
+`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block. Feed timeouts trigger an automatic MCU reset and retry cycle before giving up.
 
 ---
 
@@ -481,13 +490,53 @@ MQTT connect
 
 The feed script checks two conditions before sending a feed command, in order:
 
-1. **Cooldown guard** — a 30-second cooldown is enforced between feeds. This prevents rapid re-triggers from HA automations and gives the MCU time to fully complete a feed cycle before the next one begins. If blocked, feeder status is set to `Error` and the script stops immediately.
+1. **Cooldown guard** — a 30-second cooldown is enforced between feeds. This prevents rapid re-triggers from HA automations and gives the MCU time to fully complete a feed cycle before the next one begins. If blocked, feeder status is set to `Error` and the script stops immediately. Cooldown is skipped on automatic retries (same feed cycle).
 
-2. **MCU ready guard** — waits up to 15 seconds for `mcu_ready` (DP4=0x00 received in startup dump). This prevents silent ignores on feeds triggered immediately after a power cycle before the motor controller has initialised. If the timeout expires without `mcu_ready`, feeder status is set to `Error` and the script stops.
+2. **MCU ready guard** — waits up to 15 seconds for `mcu_ready` (DP4=0x00 received in startup dump). This prevents silent ignores on feeds triggered immediately after a power cycle before the motor controller has initialised. If the timeout expires without `mcu_ready`, one automatic handshake retry is attempted before aborting.
 
 If either guard blocks, no feed frame is sent.
 
 Note: the physical lock button state is tracked for display purposes but has no effect on remote feeding — the lock only disables the physical buttons on the feeder body.
+
+---
+
+## Feed Retry and MCU Reset
+
+The MCU enters a degraded UART state after extended uptime where it receives the feed frame but does not respond. This appears as a 30-second feed timeout — the feeder shows `Error` and `last_error` shows `Feed timeout — no done signal from MCU`.
+
+When a timeout occurs the firmware automatically resets the MCU and retries the feed:
+
+```
+30s timeout
+  │
+  ├── retries remaining (default 3)?
+  │     │
+  │     ▼
+  │   last_error: "Feed timeout — retrying (N left)"
+  │   EN LOW → mcu_connected=false, mcu_ready=false
+  │   2s delay
+  │   EN HIGH → 1s delay → do_handshake
+  │   wait_until mcu_ready (up to 20s)
+  │   feed_script re-executes with same portions
+  │     │
+  │     ├── success → Idle ✓
+  │     └── timeout again → repeat until retries exhausted
+  │
+  └── retries exhausted
+        last_error: "Feed failed — all retries exhausted"
+```
+
+The EN pin cycle (LOW → 2s → HIGH) forces the MCU to re-initialise its UART communication layer. A plain handshake without EN cycling is not sufficient to recover from this state.
+
+Each retry attempt uses the same portion count as the original command. Retries are transparent to HA — the feeder sensor stays on `Error` during the reset/retry cycle and returns to `Idle` on success.
+
+### Configuration
+
+| Entity | Default | Range | Description |
+|--------|---------|-------|-------------|
+| `Feed Max Retries` | 3 | 0–5 | Number of MCU reset+retry attempts before giving up. Set to `0` to disable retries. |
+
+Configure via MQTT: `wifi2mqtt/pet-feeder/number/feed_max_retries/command` → send `0`–`5`.
 
 ---
 
@@ -504,6 +553,12 @@ After a full power cycle, the MCU responds to the handshake (CMD01) quickly but 
 ### Physical button lock behaviour
 
 The physical lock button only disables the buttons on the feeder body. UART feed commands are accepted regardless of lock state — the lock does not block remote feeding.
+
+### MCU UART state degradation after extended uptime
+
+After extended uptime (observed at 1–3 days) the MCU enters a state where it receives UART feed commands but does not respond to them — no DP3 echo, no DP4 motor state change, no CMD34. The feed times out after 30 seconds. A plain handshake retry without toggling the EN pin does not recover the MCU from this state.
+
+The firmware handles this automatically via the feed retry mechanism: on timeout, the EN pin is cycled LOW → 2s → HIGH, which forces the MCU to re-initialise its UART communication layer. The feed is then retried with the same portion count. See [Feed Retry and MCU Reset](#feed-retry-and-mcu-reset).
 
 ### CMD 0x1C payload length — stream corruption bug (fixed)
 
@@ -530,7 +585,9 @@ The message is **retained** — the broker holds the last value indefinitely. Yo
 |---------|-------|
 | `[HH:MM:SS] Feed blocked — Xs cooldown remaining` | A feed was triggered within 30 seconds of the previous one |
 | `[HH:MM:SS] MCU not ready — motor not initialised after 15s` | Motor controller never signalled ready (DP4=0) after startup |
-| `[HH:MM:SS] Feed timeout — no done signal from MCU` | Feed frame was sent but MCU never confirmed completion within 30s |
+| `[HH:MM:SS] MCU not ready — motor not initialised after retry` | Second wait for mcu_ready also timed out |
+| `[HH:MM:SS] Feed timeout — retrying (N left)` | MCU did not respond — EN pin reset in progress, N more attempts remaining |
+| `[HH:MM:SS] Feed failed — all retries exhausted` | MCU failed to respond after all retry attempts |
 
 If SNTP hasn't synced yet when the error occurs, the timestamp prefix is omitted and the message is written without brackets.
 

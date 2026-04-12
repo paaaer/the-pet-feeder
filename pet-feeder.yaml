@@ -100,6 +100,7 @@ mqtt:
   on_message:
     - topic: ${topic_prefix}/feedCmd
       then:
+        - lambda: id(feed_retry_remaining) = -1;
         - script.execute:
             id: feed_script
             portions: !lambda "return atoi(x.c_str());"
@@ -167,6 +168,16 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  - id: feed_retry_remaining
+    type: int
+    restore_value: no
+    initial_value: '-1'   # -1 = sentinel, not in a retry sequence
+
+  - id: feed_portions_pending
+    type: int
+    restore_value: no
+    initial_value: '1'
+
 button:
   - platform: template
     name: "Dispense Meal"
@@ -174,11 +185,24 @@ button:
     icon: "mdi:bowl"
     on_press:
       then:
+        - lambda: id(feed_retry_remaining) = -1;
         - script.execute:
             id: feed_script
             portions: !lambda "return (int)id(portion_size).state;"
 
 number:
+  - platform: template
+    name: "Feed Max Retries"
+    id: feed_max_retries
+    icon: "mdi:repeat"
+    entity_category: config
+    min_value: 0
+    max_value: 5
+    step: 1
+    restore_value: yes
+    initial_value: 3
+    optimistic: true
+
   - platform: template
     name: "Portion Size"
     id: portion_size
@@ -286,6 +310,35 @@ script:
                 id(mcu_sensor).publish_state("Connected");
                 ESP_LOGI("tuya", "MCU ready — assumed idle (no DP4=0 received after 8s)");
 
+  # ── MCU reset and retry ───────────────────────────────────────────────────
+  # Called from feed_script timeout path when retries remain.
+  # Cycles the EN pin to force the MCU to re-initialise its UART state,
+  # waits for mcu_ready, then re-fires the feed with the stored portions.
+  # By the time this script calls feed_script.execute(), feed_script has
+  # already terminated (it launched this script as its last action), so
+  # mode: single allows the new execution.
+  - id: mcu_reset_and_retry
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "MCU reset — cycling EN pin to recover UART state"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_ready) = false;
+      - delay: 2s
+      - output.turn_on: mcu_en_pin
+      - delay: 1s
+      - script.execute: do_handshake
+      - wait_until:
+          condition:
+            lambda: "return id(mcu_ready);"
+          timeout: 20s
+      - script.execute:
+          id: feed_script
+          portions: !lambda "return id(feed_portions_pending);"
+
   # ── Feed script ───────────────────────────────────────────────────────────
   # Checksum verified from capture:
   #   n=1 → 0x17, n=2 → 0x18, n=4 → 0x1A  →  checksum = (0x16 + n) & 0xFF
@@ -295,18 +348,28 @@ script:
       portions: int
     mode: single
     then:
-      # Guard: 30s cooldown between feeds.
+      # On a fresh call (sentinel -1) initialise retry counter and store portions.
+      # On a retry call from mcu_reset_and_retry the counter is already set.
+      - lambda: |-
+          if (id(feed_retry_remaining) < 0) {
+            id(feed_retry_remaining) = (int)id(feed_max_retries).state;
+            id(feed_portions_pending) = portions;
+          }
+      # Guard: 30s cooldown between feeds — skipped on retries (same feed cycle).
       # Condition returns true when blocked → script.stop fires from then: block.
       # script.stop only works reliably from a child then: block, not inline.
       - if:
           condition:
             lambda: |-
+              if (id(feed_retry_remaining) < (int)id(feed_max_retries).state)
+                return false;  // retry — skip cooldown
               uint32_t now = millis();
               return id(last_feed_millis) > 0 && (now - id(last_feed_millis)) < 30000;
           then:
             - lambda: |-
                 uint32_t remaining = 30000 - (millis() - id(last_feed_millis));
                 ESP_LOGW("main", "Feed blocked — cooldown (%us remaining)", remaining / 1000);
+                id(feed_retry_remaining) = -1;
                 id(feeder_sensor).publish_state("Error");
             - mqtt.publish:
                 topic: ${topic_prefix}/last_error
@@ -350,7 +413,9 @@ script:
             - logger.log:
                 level: WARN
                 format: "MCU not ready — feed aborted after retry"
-            - lambda: id(feeder_sensor).publish_state("Error");
+            - lambda: |-
+                id(feed_retry_remaining) = -1;
+                id(feeder_sensor).publish_state("Error");
             - mqtt.publish:
                 topic: ${topic_prefix}/last_error
                 payload: !lambda |-
@@ -405,20 +470,43 @@ script:
                 id(feeder_sensor).publish_state("Error");
             - logger.log:
                 level: WARN
-                format: "Feed timeout — no done signal from MCU, running handshake reset"
-            - mqtt.publish:
-                topic: ${topic_prefix}/last_error
-                payload: !lambda |-
-                  auto t = id(sntp_time).now();
-                  char msg[80];
-                  if (t.is_valid())
-                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed timeout — no done signal from MCU",
-                             t.hour, t.minute, t.second);
-                  else
-                    snprintf(msg, sizeof(msg), "Feed timeout — no done signal from MCU");
-                  return std::string(msg);
-                retain: true
-            - script.execute: do_handshake
+                format: "Feed timeout — no done signal from MCU"
+            - if:
+                condition:
+                  lambda: "return id(feed_retry_remaining) > 0;"
+                then:
+                  - lambda: |-
+                      id(feed_retry_remaining)--;
+                      ESP_LOGW("main", "Feed timeout — resetting MCU, %d retries remaining",
+                               id(feed_retry_remaining));
+                  - mqtt.publish:
+                      topic: ${topic_prefix}/last_error
+                      payload: !lambda |-
+                        auto t = id(sntp_time).now();
+                        char msg[80];
+                        if (t.is_valid())
+                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed timeout — retrying (%d left)",
+                                   t.hour, t.minute, t.second, id(feed_retry_remaining));
+                        else
+                          snprintf(msg, sizeof(msg), "Feed timeout — retrying (%d left)",
+                                   id(feed_retry_remaining));
+                        return std::string(msg);
+                      retain: true
+                  - script.execute: mcu_reset_and_retry
+                else:
+                  - lambda: id(feed_retry_remaining) = -1;
+                  - mqtt.publish:
+                      topic: ${topic_prefix}/last_error
+                      payload: !lambda |-
+                        auto t = id(sntp_time).now();
+                        char msg[80];
+                        if (t.is_valid())
+                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed failed — all retries exhausted",
+                                   t.hour, t.minute, t.second);
+                        else
+                          snprintf(msg, sizeof(msg), "Feed failed — all retries exhausted");
+                        return std::string(msg);
+                      retain: true
 
 interval:
   - interval: 30s
