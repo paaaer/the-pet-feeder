@@ -94,7 +94,9 @@ mqtt:
       - lambda: |-
           id(mcu_connected) = false;
           id(mcu_heartbeat_seen) = false;
-          id(mcu_ready) = false;
+          // mcu_ready intentionally NOT cleared — motor controller state survives
+          // MQTT drops. Clearing it here causes feeds to fail after any network
+          // blip because the idle MCU never resends DP4=0x00 unprompted.
   on_message:
     - topic: ${topic_prefix}/feedCmd
       then:
@@ -235,6 +237,13 @@ text_sensor:
     icon: "mdi:lock"
     state_topic: ${topic_prefix}/lock
 
+  - platform: template
+    name: "Last Error"
+    id: last_error_sensor
+    icon: "mdi:alert-circle"
+    entity_category: diagnostic
+    state_topic: ${topic_prefix}/last_error
+
 script:
   # ── Tuya handshake ────────────────────────────────────────────────────────
   # Sequence confirmed from WBR3 startup capture.
@@ -260,6 +269,23 @@ script:
       - delay: 500ms
       - logger.log: "Handshake frames sent — waiting for CMD01 confirmation"
 
+  # ── MCU ready fallback ────────────────────────────────────────────────────
+  # Fires 8s after CMD01. If DP4=0x00 never arrived (MCU already idle when
+  # we connected — no state change to report), assume motor is initialised.
+  # mode: restart resets the 8s window if CMD01 fires again during a retry.
+  - id: mcu_ready_fallback
+    mode: restart
+    then:
+      - delay: 8s
+      - if:
+          condition:
+            lambda: "return id(mcu_connected) && !id(mcu_ready);"
+          then:
+            - lambda: |-
+                id(mcu_ready) = true;
+                id(mcu_sensor).publish_state("Connected");
+                ESP_LOGI("tuya", "MCU ready — assumed idle (no DP4=0 received after 8s)");
+
   # ── Feed script ───────────────────────────────────────────────────────────
   # Checksum verified from capture:
   #   n=1 → 0x17, n=2 → 0x18, n=4 → 0x1A  →  checksum = (0x16 + n) & 0xFF
@@ -276,14 +302,25 @@ script:
           condition:
             lambda: |-
               uint32_t now = millis();
-              if (id(last_feed_millis) > 0 && (now - id(last_feed_millis)) < 30000) {
-                ESP_LOGW("main", "Feed blocked — cooldown (%u ms since last feed)",
-                         now - id(last_feed_millis));
-                id(feeder_sensor).publish_state("Error");
-                return true;
-              }
-              return false;
+              return id(last_feed_millis) > 0 && (now - id(last_feed_millis)) < 30000;
           then:
+            - lambda: |-
+                uint32_t remaining = 30000 - (millis() - id(last_feed_millis));
+                ESP_LOGW("main", "Feed blocked — cooldown (%us remaining)", remaining / 1000);
+                id(feeder_sensor).publish_state("Error");
+            - mqtt.publish:
+                topic: ${topic_prefix}/last_error
+                payload: !lambda |-
+                  auto t = id(sntp_time).now();
+                  uint32_t remaining = 30000 - (millis() - id(last_feed_millis));
+                  char msg[80];
+                  if (t.is_valid())
+                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed blocked — %us cooldown remaining",
+                             t.hour, t.minute, t.second, remaining / 1000);
+                  else
+                    snprintf(msg, sizeof(msg), "Feed blocked — %us cooldown remaining", remaining / 1000);
+                  return std::string(msg);
+                retain: true
             - script.stop: feed_script
       # Guard: wait for MCU motor controller ready (DP4=0 in startup dump).
       # After a full power cycle CMD01 arrives fast but motor init takes longer.
@@ -291,14 +328,41 @@ script:
           condition:
             lambda: "return id(mcu_ready);"
           timeout: 15s
+      # If still not ready — run a handshake reset and wait once more.
+      # This recovers from MQTT reconnect cases where the idle MCU never
+      # resent DP4=0x00, and the mcu_ready_fallback hasn't fired yet.
       - if:
           condition:
             lambda: "return !id(mcu_ready);"
           then:
             - logger.log:
                 level: WARN
-                format: "MCU not ready — feed aborted, motor controller not initialised"
+                format: "MCU not ready after 15s — handshake reset, retrying once"
+            - script.execute: do_handshake
+            - wait_until:
+                condition:
+                  lambda: "return id(mcu_ready);"
+                timeout: 15s
+      - if:
+          condition:
+            lambda: "return !id(mcu_ready);"
+          then:
+            - logger.log:
+                level: WARN
+                format: "MCU not ready — feed aborted after retry"
             - lambda: id(feeder_sensor).publish_state("Error");
+            - mqtt.publish:
+                topic: ${topic_prefix}/last_error
+                payload: !lambda |-
+                  auto t = id(sntp_time).now();
+                  char msg[80];
+                  if (t.is_valid())
+                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] MCU not ready — motor not initialised after retry",
+                             t.hour, t.minute, t.second);
+                  else
+                    snprintf(msg, sizeof(msg), "MCU not ready — motor not initialised after retry");
+                  return std::string(msg);
+                retain: true
             - script.stop: feed_script
       # All guards passed — send feed
       - lambda: |-
@@ -342,6 +406,18 @@ script:
             - logger.log:
                 level: WARN
                 format: "Feed timeout — no done signal from MCU, running handshake reset"
+            - mqtt.publish:
+                topic: ${topic_prefix}/last_error
+                payload: !lambda |-
+                  auto t = id(sntp_time).now();
+                  char msg[80];
+                  if (t.is_valid())
+                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed timeout — no done signal from MCU",
+                             t.hour, t.minute, t.second);
+                  else
+                    snprintf(msg, sizeof(msg), "Feed timeout — no done signal from MCU");
+                  return std::string(msg);
+                retain: true
             - script.execute: do_handshake
 
 interval:
@@ -415,8 +491,17 @@ interval:
             if (cmd == 0x01) {
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
               id(mcu_connected) = true;
-              id(mcu_sensor).publish_state("Connected");
-              ESP_LOGI("tuya", "MCU connected");
+              if (!id(mcu_ready)) {
+                // Motor controller not yet confirmed — show Initialising and
+                // start fallback timer. If DP4=0x00 arrives first it wins;
+                // otherwise the fallback sets ready after 8s.
+                id(mcu_sensor).publish_state("Initialising");
+                id(mcu_ready_fallback).execute();
+                ESP_LOGI("tuya", "MCU connected — waiting for motor controller ready");
+              } else {
+                id(mcu_sensor).publish_state("Connected");
+                ESP_LOGI("tuya", "MCU connected");
+              }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -489,6 +574,7 @@ interval:
                   }
                   if (!id(mcu_ready)) {
                     id(mcu_ready) = true;
+                    id(mcu_sensor).publish_state("Connected");
                     ESP_LOGI("tuya", "MCU ready — motor controller initialised");
                   }
                 }
