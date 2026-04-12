@@ -35,7 +35,21 @@ All signals are 3.3V — no level shifting required. GPIO10 has no strapping pin
 
 ### EN Pin behaviour
 
-The EN pin (GPIO10) is held LOW at boot. The MCU will not begin sending heartbeats until it sees this pin go HIGH. The firmware drives it HIGH only after WiFi and MQTT are connected, ensuring the MCU never tries to communicate before the ESP32 is ready to respond.
+The EN pin (GPIO10) is held LOW at boot and driven HIGH only after WiFi and MQTT are connected, ensuring the MCU never communicates before the ESP32 is ready.
+
+**First boot after power cycle** — The MCU needs ~10 seconds from power-on to finish booting, but the ESP32 connects to WiFi+MQTT in ~5 seconds. To prevent the MCU from missing the EN rising edge, the firmware holds EN LOW until 10 seconds from power-on before raising it:
+
+```
+MQTT connects (~5s from boot)
+  first_connect_done = false → wait until millis() ≥ 10 000 ms
+  EN pin → HIGH  (~10s from boot)
+```
+
+If MQTT takes longer than 10 seconds to connect (slow WiFi), the wait resolves to zero and EN rises immediately.
+
+**Subsequent MQTT reconnects** — `first_connect_done` is set after the first EN rise and persists until the next ESP restart. On reconnects the delay is skipped and EN rises immediately — the MCU is already running and responds quickly.
+
+**Boot watchdog** — If the MCU still has not responded with CMD01 after 60 seconds of handshake retries (e.g. very slow boot or missed edge), the firmware pulses EN LOW → 2s → HIGH to give the MCU a fresh rising edge. This repeats every 60 seconds until CMD01 arrives.
 
 ---
 
@@ -94,13 +108,16 @@ The boot sequence is fully event-driven — the firmware waits for actual eviden
 ```
 on_boot
   EN pin → LOW
-  mcu_ready = false, mcu_connected = false, feeding_active = false
+  mcu_ready = false, mcu_connected = false, first_connect_done = false
        ↓
-WiFi connects (~2–5s)
+WiFi + MQTT connect (~5s from boot)
        ↓
-MQTT connects → on_connect
+on_connect:
   feeder = "Idle", mcu = "Disconnected", lock = "Unlocked"
-  EN pin → HIGH   ← MCU wakes, starts sending heartbeats
+  first_connect_done = false → hold EN LOW until millis() ≥ 10 000 ms
+       ↓ (~10s from boot)
+  EN pin → HIGH   ← MCU wakes, starts Tuya handshake
+  first_connect_done = true
   delay 1s → do_handshake (7 frames)
        ↓
 MCU responds CMD01
@@ -109,18 +126,23 @@ MCU responds CMD01
   mcu_ready_fallback starts (8s timer)
        ↓
 MCU sends startup DP dump → DP4=0x00 arrives
-  mcu_ready = true, mcu = "Connected"   ← fallback cancelled by condition check
+  mcu_ready = true, mcu = "Connected"
        ↓
-Ready for feeds ✓
+Ready for feeds ✓  (~12–15s from boot)
 ```
+
+If CMD01 never arrives (e.g. very slow MCU boot), the 5s handshake interval keeps retrying. After 60s of no response the boot watchdog pulses EN LOW → 2s → HIGH and resets the retry counter, repeating every 60s until the MCU responds.
 
 **Scenario 2 — ESP-only reboot (OTA flash, crash, scheduled reboot):**
 
-The MCU stays powered and running throughout. `on_boot` clears `mcu_ready`, but the idle MCU has no motor state change to report, so it never sends DP4=0x00 after the handshake. The `mcu_ready_fallback` carries this case:
+The MCU stays powered and running throughout. `on_boot` clears `mcu_ready` and `first_connect_done`, so the 10s EN delay applies again. The idle MCU has no motor state change to report, so it never sends DP4=0x00 after the handshake — the `mcu_ready_fallback` carries this case:
 ```
-on_boot: mcu_ready = false
+on_boot: mcu_ready = false, first_connect_done = false
        ↓
-MQTT connects → do_handshake
+MQTT connects (~5s)
+  first_connect_done = false → hold EN LOW until 10s from boot
+       ↓
+EN pin → HIGH → do_handshake
        ↓
 CMD01 arrives
   mcu_ready is false → mcu = "Initialising"
@@ -483,10 +505,12 @@ MQTT connect
            │     → wait mcu_ready → retry feed ──────────────────► [Feeding]
            │     (repeats up to Feed Max Retries times)
            │
-           └── retries exhausted → last_error: "all retries exhausted"
+           └── retries exhausted → last_error: "all retries exhausted, rebooting"
+                 → mcu_reboot: EN LOW → 2s → esp_restart()
+                 → device comes back online automatically
 ```
 
-`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block. Feed timeouts trigger an automatic MCU reset and retry cycle before giving up.
+`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block. Feed timeouts trigger an automatic MCU reset and retry cycle. If all retries fail the ESP restarts cleanly — the MCU gets a full EN LOW → HIGH reset and the device recovers without manual intervention.
 
 ---
 
@@ -527,10 +551,18 @@ When a timeout occurs the firmware automatically resets the MCU and retries the 
   │     └── timeout again → repeat until retries exhausted
   │
   └── retries exhausted
-        last_error: "Feed failed — all retries exhausted"
+        last_error: "Feed failed — all retries exhausted, rebooting"
+        500ms delay
+        mcu_reboot: EN LOW → 2s → esp_restart()
+          ↓
+        Device reboots, reconnects, MCU gets clean EN rising edge
+        availability: "restarting" → "offline" → "online"
+        User can retry feed manually after reconnect
 ```
 
 The EN pin cycle (LOW → 2s → HIGH) forces the MCU to re-initialise its UART communication layer. A plain handshake without EN cycling is not sufficient to recover from this state.
+
+When all retries are exhausted the firmware performs a full ESP restart rather than leaving the device stuck. The MCU receives a proper 2s EN LOW period (no UART traffic during restart), giving it the same reset conditions as a power cycle. The device comes back online automatically without manual intervention.
 
 Each retry attempt uses the same portion count as the original command. Retries are transparent to HA — the feeder sensor stays on `Error` during the reset/retry cycle and returns to `Idle` on success.
 
@@ -562,15 +594,15 @@ on_time fires at configured hour (:00)
   ESP.restart()
     │
     ▼
-  on_boot: EN stays LOW
-  WiFi + MQTT reconnect
-  on_connect: EN HIGH → do_handshake
-  Normal operation resumes ✓
+  on_boot: EN stays LOW, first_connect_done = false
+  WiFi + MQTT reconnect (~5s)
+  on_connect: hold EN LOW until 10s from boot → EN HIGH → do_handshake
+  Normal operation resumes ✓  (~12–15s from restart)
 ```
 
-The EN LOW → 2s → restart pattern is the same used by the feed retry MCU reset (`mcu_reset_and_retry`), extracted into the shared `mcu_reboot` script. A plain `ESP.restart()` without the EN hold is not used — the 2s LOW period is required for the MCU to fully reinitialise its UART state.
+The `mcu_reboot` script is shared by the scheduled reboot, the feed-retry exhausted path, and any future hard-reset needs. The EN LOW → 2s hold ensures the MCU fully resets its UART state before the ESP comes back up. `first_connect_done` is reset on every ESP restart so the 10s boot delay always applies on the first reconnect after a reboot — whether scheduled, OTA-triggered, or from a feed failure.
 
-After the reboot, `availability` transitions `restarting` → `offline` → `online`. A crash or brownout reboot shows only `offline` → `online` with no `restarting` prefix.
+After the reboot, `availability` transitions `restarting` → `offline` → `online`. A crash or unexpected brownout reboot shows only `offline` → `online` with no `restarting` prefix, which can be used to distinguish the two in HA automations.
 
 ### Configuration
 
@@ -634,7 +666,7 @@ The message is **retained** — the broker holds the last value indefinitely. Yo
 | `[HH:MM:SS] MCU not ready — motor not initialised after 15s` | Motor controller never signalled ready (DP4=0) after startup |
 | `[HH:MM:SS] MCU not ready — motor not initialised after retry` | Second wait for mcu_ready also timed out |
 | `[HH:MM:SS] Feed timeout — retrying (N left)` | MCU did not respond — EN pin reset in progress, N more attempts remaining |
-| `[HH:MM:SS] Feed failed — all retries exhausted` | MCU failed to respond after all retry attempts |
+| `[HH:MM:SS] Feed failed — all retries exhausted, rebooting` | MCU failed to respond after all retry attempts — ESP restart initiated |
 
 If SNTP hasn't synced yet when the error occurs, the timestamp prefix is omitted and the message is written without brackets.
 
