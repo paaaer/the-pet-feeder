@@ -39,6 +39,20 @@ time:
         - logger.log:
             level: INFO
             format: "SNTP time synchronised"
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: /1
+        then:
+          - if:
+              condition:
+                lambda: 'return id(auto_reboot_en).state &&
+                                (int)id(sntp_time).now().hour == (int)id(reboot_hour).state;'
+              then:
+                - logger.log:
+                    level: INFO
+                    format: "Scheduled daily reboot triggered"
+                - script.execute: mcu_reboot
 
 ota:
   - platform: esphome
@@ -82,6 +96,16 @@ mqtt:
       - lambda: id(feeder_sensor).publish_state("Idle");
       - lambda: id(mcu_sensor).publish_state("Disconnected");
       - lambda: id(lock_sensor).publish_state("Unlocked");
+      # On first boot hold EN LOW until 10s from power-on.
+      # ESP connects WiFi+MQTT in ~5s; MCU needs ~10s to finish booting.
+      # Without this the MCU misses the first EN rising edge.
+      # On MQTT reconnects (first_connect_done=true) EN rises immediately.
+      - if:
+          condition:
+            lambda: "return !id(first_connect_done);"
+          then:
+            - delay: !lambda "return (uint32_t)std::max(0, 10000 - (int)millis());"
+            - lambda: id(first_connect_done) = true;
       - output.turn_on: mcu_en_pin
       - logger.log:
           level: INFO
@@ -94,10 +118,13 @@ mqtt:
       - lambda: |-
           id(mcu_connected) = false;
           id(mcu_heartbeat_seen) = false;
-          id(mcu_ready) = false;
+          // mcu_ready intentionally NOT cleared — motor controller state survives
+          // MQTT drops. Clearing it here causes feeds to fail after any network
+          // blip because the idle MCU never resends DP4=0x00 unprompted.
   on_message:
     - topic: ${topic_prefix}/feedCmd
       then:
+        - lambda: id(feed_retry_remaining) = -1;
         - script.execute:
             id: feed_script
             portions: !lambda "return atoi(x.c_str());"
@@ -165,6 +192,35 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  - id: feed_retry_remaining
+    type: int
+    restore_value: no
+    initial_value: '-1'   # -1 = sentinel, not in a retry sequence
+
+  - id: feed_portions_pending
+    type: int
+    restore_value: no
+    initial_value: '1'
+
+  - id: handshake_attempts
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: first_connect_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+switch:
+  - platform: template
+    name: "Auto Reboot"
+    id: auto_reboot_en
+    icon: "mdi:restart"
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+
 button:
   - platform: template
     name: "Dispense Meal"
@@ -172,11 +228,37 @@ button:
     icon: "mdi:bowl"
     on_press:
       then:
+        - lambda: id(feed_retry_remaining) = -1;
         - script.execute:
             id: feed_script
             portions: !lambda "return (int)id(portion_size).state;"
 
 number:
+  - platform: template
+    name: "Reboot Hour"
+    id: reboot_hour
+    icon: "mdi:clock-restart"
+    entity_category: config
+    min_value: 0
+    max_value: 23
+    step: 1
+    restore_value: yes
+    initial_value: 3
+    optimistic: true
+    unit_of_measurement: "h"
+
+  - platform: template
+    name: "Feed Max Retries"
+    id: feed_max_retries
+    icon: "mdi:repeat"
+    entity_category: config
+    min_value: 0
+    max_value: 5
+    step: 1
+    restore_value: yes
+    initial_value: 3
+    optimistic: true
+
   - platform: template
     name: "Portion Size"
     id: portion_size
@@ -235,6 +317,13 @@ text_sensor:
     icon: "mdi:lock"
     state_topic: ${topic_prefix}/lock
 
+  - platform: template
+    name: "Last Error"
+    id: last_error_sensor
+    icon: "mdi:alert-circle"
+    entity_category: diagnostic
+    state_topic: ${topic_prefix}/last_error
+
 script:
   # ── Tuya handshake ────────────────────────────────────────────────────────
   # Sequence confirmed from WBR3 startup capture.
@@ -260,6 +349,96 @@ script:
       - delay: 500ms
       - logger.log: "Handshake frames sent — waiting for CMD01 confirmation"
 
+  # ── MCU ready fallback ────────────────────────────────────────────────────
+  # Fires 8s after CMD01. If DP4=0x00 never arrived (MCU already idle when
+  # we connected — no state change to report), assume motor is initialised.
+  # mode: restart resets the 8s window if CMD01 fires again during a retry.
+  - id: mcu_ready_fallback
+    mode: restart
+    then:
+      - delay: 8s
+      - if:
+          condition:
+            lambda: "return id(mcu_connected) && !id(mcu_ready);"
+          then:
+            - lambda: |-
+                id(mcu_ready) = true;
+                id(mcu_sensor).publish_state("Connected");
+                ESP_LOGI("tuya", "MCU ready — assumed idle (no DP4=0 received after 8s)");
+
+  # ── EN re-pulse (boot watchdog) ──────────────────────────────────────────
+  # After a full power cycle the MCU takes ~60s to boot, but the ESP drives
+  # EN HIGH in ~5s. The MCU misses the first rising edge and never starts the
+  # handshake. This script re-pulses EN LOW→HIGH to give the MCU a fresh edge
+  # once it is ready. Called from the 5s interval after 60s of no response.
+  - id: en_repulse
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "MCU not responding after 60s — re-pulsing EN for fresh rising edge"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_ready) = false;
+          id(handshake_attempts) = 0;
+      - delay: 2s
+      - output.turn_on: mcu_en_pin
+      - delay: 1s
+      - script.execute: do_handshake
+
+  # ── MCU reboot ────────────────────────────────────────────────────────────
+  # Pulls EN LOW for 2s then restarts the ESP32.
+  # The 2s hold lets the MCU fully reset its UART state before the ESP comes
+  # back up. After restart, on_boot holds EN LOW, then on_connect drives it
+  # HIGH again — same clean rising edge as a full power cycle.
+  # Used by the scheduled daily reboot. Can also be called for any hard reset.
+  - id: mcu_reboot
+    mode: single
+    then:
+      - mqtt.publish:
+          topic: ${topic_prefix}/availability
+          payload: "restarting"
+          retain: true
+      - logger.log:
+          level: INFO
+          format: "MCU reboot — EN LOW, restarting in 2s"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_ready) = false;
+      - delay: 2s
+      - lambda: 'esp_restart();'
+
+  # ── MCU reset and retry ───────────────────────────────────────────────────
+  # Called from feed_script timeout path when retries remain.
+  # Cycles the EN pin to force the MCU to re-initialise its UART state,
+  # waits for mcu_ready, then re-fires the feed with the stored portions.
+  # By the time this script calls feed_script.execute(), feed_script has
+  # already terminated (it launched this script as its last action), so
+  # mode: single allows the new execution.
+  - id: mcu_reset_and_retry
+    mode: single
+    then:
+      - logger.log:
+          level: WARN
+          format: "MCU reset — cycling EN pin to recover UART state"
+      - output.turn_off: mcu_en_pin
+      - lambda: |-
+          id(mcu_connected) = false;
+          id(mcu_ready) = false;
+      - delay: 2s
+      - output.turn_on: mcu_en_pin
+      - delay: 1s
+      - script.execute: do_handshake
+      - wait_until:
+          condition:
+            lambda: "return id(mcu_ready);"
+          timeout: 20s
+      - script.execute:
+          id: feed_script
+          portions: !lambda "return id(feed_portions_pending);"
+
   # ── Feed script ───────────────────────────────────────────────────────────
   # Checksum verified from capture:
   #   n=1 → 0x17, n=2 → 0x18, n=4 → 0x1A  →  checksum = (0x16 + n) & 0xFF
@@ -269,21 +448,42 @@ script:
       portions: int
     mode: single
     then:
-      # Guard: 30s cooldown between feeds.
+      # On a fresh call (sentinel -1) initialise retry counter and store portions.
+      # On a retry call from mcu_reset_and_retry the counter is already set.
+      - lambda: |-
+          if (id(feed_retry_remaining) < 0) {
+            id(feed_retry_remaining) = (int)id(feed_max_retries).state;
+            id(feed_portions_pending) = portions;
+          }
+      # Guard: 30s cooldown between feeds — skipped on retries (same feed cycle).
       # Condition returns true when blocked → script.stop fires from then: block.
       # script.stop only works reliably from a child then: block, not inline.
       - if:
           condition:
             lambda: |-
+              if (id(feed_retry_remaining) < (int)id(feed_max_retries).state)
+                return false;  // retry — skip cooldown
               uint32_t now = millis();
-              if (id(last_feed_millis) > 0 && (now - id(last_feed_millis)) < 30000) {
-                ESP_LOGW("main", "Feed blocked — cooldown (%u ms since last feed)",
-                         now - id(last_feed_millis));
-                id(feeder_sensor).publish_state("Error");
-                return true;
-              }
-              return false;
+              return id(last_feed_millis) > 0 && (now - id(last_feed_millis)) < 30000;
           then:
+            - lambda: |-
+                uint32_t remaining = 30000 - (millis() - id(last_feed_millis));
+                ESP_LOGW("main", "Feed blocked — cooldown (%us remaining)", remaining / 1000);
+                id(feed_retry_remaining) = -1;
+                id(feeder_sensor).publish_state("Error");
+            - mqtt.publish:
+                topic: ${topic_prefix}/last_error
+                payload: !lambda |-
+                  auto t = id(sntp_time).now();
+                  uint32_t remaining = 30000 - (millis() - id(last_feed_millis));
+                  char msg[80];
+                  if (t.is_valid())
+                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed blocked — %us cooldown remaining",
+                             t.hour, t.minute, t.second, remaining / 1000);
+                  else
+                    snprintf(msg, sizeof(msg), "Feed blocked — %us cooldown remaining", remaining / 1000);
+                  return std::string(msg);
+                retain: true
             - script.stop: feed_script
       # Guard: wait for MCU motor controller ready (DP4=0 in startup dump).
       # After a full power cycle CMD01 arrives fast but motor init takes longer.
@@ -291,14 +491,43 @@ script:
           condition:
             lambda: "return id(mcu_ready);"
           timeout: 15s
+      # If still not ready — run a handshake reset and wait once more.
+      # This recovers from MQTT reconnect cases where the idle MCU never
+      # resent DP4=0x00, and the mcu_ready_fallback hasn't fired yet.
       - if:
           condition:
             lambda: "return !id(mcu_ready);"
           then:
             - logger.log:
                 level: WARN
-                format: "MCU not ready — feed aborted, motor controller not initialised"
-            - lambda: id(feeder_sensor).publish_state("Error");
+                format: "MCU not ready after 15s — handshake reset, retrying once"
+            - script.execute: do_handshake
+            - wait_until:
+                condition:
+                  lambda: "return id(mcu_ready);"
+                timeout: 15s
+      - if:
+          condition:
+            lambda: "return !id(mcu_ready);"
+          then:
+            - logger.log:
+                level: WARN
+                format: "MCU not ready — feed aborted after retry"
+            - lambda: |-
+                id(feed_retry_remaining) = -1;
+                id(feeder_sensor).publish_state("Error");
+            - mqtt.publish:
+                topic: ${topic_prefix}/last_error
+                payload: !lambda |-
+                  auto t = id(sntp_time).now();
+                  char msg[80];
+                  if (t.is_valid())
+                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] MCU not ready — motor not initialised after retry",
+                             t.hour, t.minute, t.second);
+                  else
+                    snprintf(msg, sizeof(msg), "MCU not ready — motor not initialised after retry");
+                  return std::string(msg);
+                retain: true
             - script.stop: feed_script
       # All guards passed — send feed
       - lambda: |-
@@ -341,8 +570,47 @@ script:
                 id(feeder_sensor).publish_state("Error");
             - logger.log:
                 level: WARN
-                format: "Feed timeout — no done signal from MCU, running handshake reset"
-            - script.execute: do_handshake
+                format: "Feed timeout — no done signal from MCU"
+            - if:
+                condition:
+                  lambda: "return id(feed_retry_remaining) > 0;"
+                then:
+                  - lambda: |-
+                      id(feed_retry_remaining)--;
+                      ESP_LOGW("main", "Feed timeout — resetting MCU, %d retries remaining",
+                               id(feed_retry_remaining));
+                  - mqtt.publish:
+                      topic: ${topic_prefix}/last_error
+                      payload: !lambda |-
+                        auto t = id(sntp_time).now();
+                        char msg[80];
+                        if (t.is_valid())
+                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed timeout — retrying (%d left)",
+                                   t.hour, t.minute, t.second, id(feed_retry_remaining));
+                        else
+                          snprintf(msg, sizeof(msg), "Feed timeout — retrying (%d left)",
+                                   id(feed_retry_remaining));
+                        return std::string(msg);
+                      retain: true
+                  - script.execute: mcu_reset_and_retry
+                else:
+                  - lambda: id(feed_retry_remaining) = -1;
+                  - mqtt.publish:
+                      topic: ${topic_prefix}/last_error
+                      payload: !lambda |-
+                        auto t = id(sntp_time).now();
+                        char msg[80];
+                        if (t.is_valid())
+                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed failed — all retries exhausted, rebooting",
+                                   t.hour, t.minute, t.second);
+                        else
+                          snprintf(msg, sizeof(msg), "Feed failed — all retries exhausted, rebooting");
+                        return std::string(msg);
+                      retain: true
+                  # MCU is unresponsive even after EN cycles — do a full ESP restart
+                  # so the MCU gets a clean 2s EN LOW + proper rising edge on reconnect.
+                  - delay: 500ms
+                  - script.execute: mcu_reboot
 
 interval:
   - interval: 30s
@@ -356,12 +624,23 @@ interval:
     then:
       - if:
           condition:
-            lambda: "return !id(mcu_connected) && !id(do_handshake).is_running();"
+            lambda: |-
+              return !id(mcu_connected)
+                  && !id(do_handshake).is_running()
+                  && !id(mcu_reset_and_retry).is_running()
+                  && !id(en_repulse).is_running();
           then:
-            - logger.log:
-                level: WARN
-                format: "MCU not connected — retrying handshake"
-            - script.execute: do_handshake
+            - lambda: id(handshake_attempts)++;
+            - if:
+                condition:
+                  lambda: "return id(handshake_attempts) >= 12;"  # 60s
+                then:
+                  - script.execute: en_repulse
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "MCU not connected — retrying handshake"
+                  - script.execute: do_handshake
 
   # ── UART RX poll (100ms) ──────────────────────────────────────────────────
   # MCU sends Tuya v3 frames (55 AA 03 ...).
@@ -415,8 +694,18 @@ interval:
             if (cmd == 0x01) {
               ESP_LOGD("tuya", "CMD01 product info received (%d bytes)", payload_len);
               id(mcu_connected) = true;
-              id(mcu_sensor).publish_state("Connected");
-              ESP_LOGI("tuya", "MCU connected");
+              id(handshake_attempts) = 0;  // stop boot watchdog counter
+              if (!id(mcu_ready)) {
+                // Motor controller not yet confirmed — show Initialising and
+                // start fallback timer. If DP4=0x00 arrives first it wins;
+                // otherwise the fallback sets ready after 8s.
+                id(mcu_sensor).publish_state("Initialising");
+                id(mcu_ready_fallback).execute();
+                ESP_LOGI("tuya", "MCU connected — waiting for motor controller ready");
+              } else {
+                id(mcu_sensor).publish_state("Connected");
+                ESP_LOGI("tuya", "MCU connected");
+              }
               buf.erase(buf.begin(), buf.begin() + full_len);
               continue;
             }
@@ -489,6 +778,7 @@ interval:
                   }
                   if (!id(mcu_ready)) {
                     id(mcu_ready) = true;
+                    id(mcu_sensor).publish_state("Connected");
                     ESP_LOGI("tuya", "MCU ready — motor controller initialised");
                   }
                 }

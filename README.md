@@ -35,7 +35,21 @@ All signals are 3.3V — no level shifting required. GPIO10 has no strapping pin
 
 ### EN Pin behaviour
 
-The EN pin (GPIO10) is held LOW at boot. The MCU will not begin sending heartbeats until it sees this pin go HIGH. The firmware drives it HIGH only after WiFi and MQTT are connected, ensuring the MCU never tries to communicate before the ESP32 is ready to respond.
+The EN pin (GPIO10) is held LOW at boot and driven HIGH only after WiFi and MQTT are connected, ensuring the MCU never communicates before the ESP32 is ready.
+
+**First boot after power cycle** — The MCU needs ~10 seconds from power-on to finish booting, but the ESP32 connects to WiFi+MQTT in ~5 seconds. To prevent the MCU from missing the EN rising edge, the firmware holds EN LOW until 10 seconds from power-on before raising it:
+
+```
+MQTT connects (~5s from boot)
+  first_connect_done = false → wait until millis() ≥ 10 000 ms
+  EN pin → HIGH  (~10s from boot)
+```
+
+If MQTT takes longer than 10 seconds to connect (slow WiFi), the wait resolves to zero and EN rises immediately.
+
+**Subsequent MQTT reconnects** — `first_connect_done` is set after the first EN rise and persists until the next ESP restart. On reconnects the delay is skipped and EN rises immediately — the MCU is already running and responds quickly.
+
+**Boot watchdog** — If the MCU still has not responded with CMD01 after 60 seconds of handshake retries (e.g. very slow boot or missed edge), the firmware pulses EN LOW → 2s → HIGH to give the MCU a fresh rising edge. This repeats every 60 seconds until CMD01 arrives.
 
 ---
 
@@ -90,43 +104,114 @@ The boot sequence is fully event-driven — the firmware waits for actual eviden
 
 ### Boot sequence
 
-The firmware handles two distinct boot scenarios:
-
-**Full power cycle (both ESP32 and feeder board powered together):**
+**Scenario 1 — Full power cycle (both boards cold start):**
 ```
-Power on → on_boot: EN LOW (held)
-         → WiFi + MQTT connect
-         → on_connect: EN HIGH → rising edge
-         → MCU wakes, sends heartbeat (status=0x00)
-         → 1s delay → handshake fires
-         → MCU replies CMD01 → mcu_connected = true ✅
-         → MCU sends DP state dump (DP14, CMD34, DP25, DP4=0, DP10)
-         → DP4=0x00 received → mcu_ready = true ✅
+on_boot
+  EN pin → LOW
+  mcu_ready = false, mcu_connected = false, first_connect_done = false
+       ↓
+WiFi + MQTT connect (~5s from boot)
+       ↓
+on_connect:
+  feeder = "Idle", mcu = "Disconnected", lock = "Unlocked"
+  first_connect_done = false → hold EN LOW until millis() ≥ 10 000 ms
+       ↓ (~10s from boot)
+  EN pin → HIGH   ← MCU wakes, starts Tuya handshake
+  first_connect_done = true
+  delay 1s → do_handshake (7 frames)
+       ↓
+MCU responds CMD01
+  mcu_connected = true
+  mcu_ready is false → mcu = "Initialising"
+  mcu_ready_fallback starts (8s timer)
+       ↓
+MCU sends startup DP dump → DP4=0x00 arrives
+  mcu_ready = true, mcu = "Connected"
+       ↓
+Ready for feeds ✓  (~12–15s from boot)
 ```
 
-**ESP32-only reboot (OTA flash, crash, etc.):**
+If CMD01 never arrives (e.g. very slow MCU boot), the 5s handshake interval keeps retrying. After 60s of no response the boot watchdog pulses EN LOW → 2s → HIGH and resets the retry counter, repeating every 60s until the MCU responds.
+
+**Scenario 2 — ESP-only reboot (OTA flash, crash, scheduled reboot):**
+
+The MCU stays powered and running throughout. `on_boot` clears `mcu_ready` and `first_connect_done`, so the 10s EN delay applies again. The idle MCU has no motor state change to report, so it never sends DP4=0x00 after the handshake — the `mcu_ready_fallback` carries this case:
 ```
-Reboot → on_boot: EN LOW (MCU already running, ignores it)
-       → WiFi + MQTT connect
-       → on_connect: EN HIGH (MCU ignores it, already running)
-       → 1s delay → handshake fires directly
-       → MCU replies CMD01 → mcu_connected = true ✅
-       → MCU replies to CMD02 with DP state dump → DP4=0x00 → mcu_ready = true ✅
-       → Feed commands accepted immediately after mcu_ready ✅
-       → 5s retry interval keeps retrying if CMD01 never arrives ✅
+on_boot: mcu_ready = false, first_connect_done = false
+       ↓
+MQTT connects (~5s)
+  first_connect_done = false → hold EN LOW until 10s from boot
+       ↓
+EN pin → HIGH → do_handshake
+       ↓
+CMD01 arrives
+  mcu_ready is false → mcu = "Initialising"
+  mcu_ready_fallback starts (8s timer)
+  ... MCU idle, no DP4=0x00 sent ...
+  8s later: mcu_ready = true, mcu = "Connected"
+       ↓
+Ready for feeds ✓
 ```
 
-No special detection of "ESP-only reboot" vs "full power cycle" is needed — the handshake always fires from `on_connect` and the MCU always responds to CMD02 (state query) with a full DP dump regardless of whether it just powered on or was already running. The result is identical from the firmware's perspective.
+**Scenario 3 — MQTT network blip (brief disconnect/reconnect):**
 
-The EN pin on this board is only sampled at MCU power-on. Driving EN LOW briefly during an ESP reboot has no effect on an already-running MCU.
+`mcu_ready` is intentionally **not** cleared on MQTT disconnect — the motor controller state has nothing to do with whether the broker is reachable. Clearing it here was the root cause of intermittent morning feed failures after overnight broker hiccups.
+```
+MQTT drops → on_disconnect
+  EN pin → LOW
+  mcu_connected = false
+  mcu_ready stays true  ← not cleared
+       ↓
+MQTT reconnects → on_connect
+  EN pin → HIGH → do_handshake
+       ↓
+CMD01 arrives
+  mcu_ready already true → mcu = "Connected" immediately
+  no fallback needed
+       ↓
+Ready for feeds instantly ✓
+```
+
+**Scenario 4 — Feed triggered during initialisation window:**
+
+If a scheduled feed fires during the 8s fallback window after an ESP reboot:
+```
+feed_script starts
+  wait_until mcu_ready — timeout 15s
+    → fallback fires at ~8s → mcu_ready = true
+  proceeds immediately ✓
+```
+
+If `mcu_ready` is still false after the full 15s wait, the feed script does one automatic recovery attempt before aborting:
+```
+  → WARN: "not ready after 15s — handshake reset, retrying once"
+  → do_handshake runs → new CMD01 → mcu_ready_fallback restarts
+  → wait_until mcu_ready — timeout 15s
+    → fallback fires at ~8s → mcu_ready = true
+  proceeds ✓
+
+  If still nothing after second 15s wait:
+  → Error published to MQTT last_error with "after retry" in message
+  → feed aborted
+```
+
+### MCU status during startup
+
+The `mcu` sensor reflects the ready state in real time:
+
+| `wifi2mqtt/pet-feeder/mcu` | Meaning |
+|---|---|
+| `Disconnected` | MQTT just connected, handshake not yet sent |
+| `Initialising` | CMD01 received — waiting for DP4=0x00 or 8s fallback |
+| `Connected` | Motor controller ready — feeds accepted |
 
 ### MCU readiness
 
-`mcu_connected` (CMD01 received) and `mcu_ready` (DP4=0x00 received in startup dump) are tracked separately. CMD01 arrives fast but the motor controller takes longer to initialise. The feed script waits up to 15 seconds for `mcu_ready` before sending a feed command, preventing a silent ignore on feeds triggered immediately after a power cycle.
+`mcu_connected` (CMD01 received) and `mcu_ready` (DP4=0x00 or 8s fallback) are tracked separately. CMD01 arrives fast but the motor controller takes longer to initialise on a cold start. The feed script waits up to 15 seconds for `mcu_ready` before sending any feed command, with one automatic retry if the first wait expires.
 
 ### Disconnect / reconnect
 
-On MQTT disconnect the EN pin is driven **LOW** and `mcu_connected`, `mcu_heartbeat_seen` and `mcu_ready` are all cleared. On the next MQTT reconnect the full sequence repeats.
+On MQTT disconnect the EN pin is driven **LOW** and `mcu_connected` and `mcu_heartbeat_seen` are cleared. `mcu_ready` is intentionally preserved — it is only reset by `on_boot` (a full ESP restart), not by transient broker disconnects.
 
 ### Handshake frames
 
@@ -343,19 +428,23 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 
 | Topic | Retained | Values | Description |
 |-------|----------|--------|-------------|
-| `availability` | yes | `online` / `offline` | LWT — broker sets `offline` on disconnect, firmware sets `online` on connect |
+| `availability` | yes | `online` / `offline` / `restarting` | LWT — broker sets `offline` on disconnect, firmware sets `online` on connect. `restarting` is published just before a scheduled reboot so it can be distinguished from a crash |
 | `feeder` | yes | `Idle` / `Feeding` / `Error` | Feeder motor state. Set by MCU responses — never by a timer |
-| `mcu` | yes | `Connected` / `Disconnected` | MCU handshake state |
+| `mcu` | yes | `Disconnected` / `Initialising` / `Connected` | MCU handshake state. `Initialising` = CMD01 received, waiting for motor controller ready |
 | `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
+| `last_error` | yes | timestamped string | Last error reason — retained, persists across reboots. See [Last error topic](#last-error-topic) |
 | `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
 | `ip` | no | IP address string | Device IP address, updated on change |
-| `debug` | no | text | Serial log mirror — published when `mqtt_debug` is set to the topic string |
+| `debug` | no | text | Serial log mirror — published when `logger: mqtt_topic:` is configured |
 
 ### Command topics (HA → ESP)
 
 | Topic | Values | Description |
 |-------|--------|-------------|
 | `feedCmd` | `1`–`12` | Trigger a feed cycle. Payload is the number of portions to dispense |
+| `number/feed_max_retries/command` | `0`–`5` | Set the number of MCU reset+retry attempts on feed timeout |
+| `switch/auto-reboot/command` | `ON` / `OFF` | Enable or disable the scheduled daily reboot |
+| `number/reboot-hour/command` | `0`–`23` | Hour of day to reboot (local time). Default `3` = 03:00 |
 
 ### Home Assistant discovery
 
@@ -364,11 +453,15 @@ ESPHome publishes MQTT discovery messages automatically to `homeassistant/sensor
 | Entity | Type | Topic |
 |--------|------|-------|
 | Feeder Status | Sensor | `wifi2mqtt/pet-feeder/feeder` |
-| MCU Status | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/mcu` |
+| MCU Status | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/mcu` — values: `Disconnected` / `Initialising` / `Connected` |
 | Lock Status | Sensor | `wifi2mqtt/pet-feeder/lock` |
+| Last Error | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/last_error` |
 | RSSI | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/rssi` |
 | IP | Sensor (diagnostic) | `wifi2mqtt/pet-feeder/ip` |
-| Portion Size | Number | `wifi2mqtt/pet-feeder/number/portion_size/state` |
+| Portion Size | Number (config) | `wifi2mqtt/pet-feeder/number/portion_size/state` |
+| Feed Max Retries | Number (config) | `wifi2mqtt/pet-feeder/number/feed_max_retries/state` — default 3, range 0–5 |
+| Reboot Hour | Number (config) | `wifi2mqtt/pet-feeder/number/reboot-hour/state` — default 3, range 0–23 |
+| Auto Reboot | Switch (config) | `wifi2mqtt/pet-feeder/switch/auto-reboot/state` — default ON |
 | Dispense Meal | Button | `wifi2mqtt/pet-feeder/button/dispense_meal/command` |
 
 The `state_topic` for each sensor is explicitly set in the firmware to match the clean topic paths above, ensuring discovery config and state publishes always use the same topic.
@@ -377,7 +470,8 @@ The `state_topic` for each sensor is explicitly set in the firmware to match the
 
 - All state topics use `retain: true` so Home Assistant always has the last known state after a restart.
 - `availability` uses the MQTT LWT mechanism — the broker automatically publishes `offline` on unexpected disconnect.
-- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is set on 30-second timeout or cooldown block.
+- `feeder` is only set to `Idle` by MCU responses (CMD34 DP11 or CMD07 DP4=0x00), never on a timer. `Error` is set on 30-second timeout or cooldown block. Each time `Error` is set, the reason and timestamp are also published to `last_error`.
+- `last_error` is retained at the broker, so even after an ESP reboot you can query it to see what went wrong before the restart.
 
 ---
 
@@ -389,25 +483,34 @@ MQTT connect
   [wait mcu_ready] ── 15s timeout ──► [Error]
      │
      ▼
-   [Idle] ◄──────────────────────────────────────────┐
-     │                                                │
-     │  feedCmd received / Dispense button pressed    │
-     ├── cooldown active (<30s since last) ──────────► [Error] (immediate)
-     ▼                                                │
- [Feeding]                                            │
-     │                                                │
-     ├── CMD34 DP11 received ─────────────────────────┤  (primary done signal)
-     ├── CMD07 DP4=0x00 received ────────────────────►┘  (secondary done signal)
+   [Idle] ◄──────────────────────────────────────────────────────┐
+     │                                                            │
+     │  feedCmd received / Dispense button pressed                │
+     ├── cooldown active (<30s since last) ──────────────────► [Error] (immediate)
+     ▼                                                            │
+ [Feeding]                                                        │
+     │                                                            │
+     ├── CMD34 DP11 received ─────────────────────────────────────┤  (primary)
+     ├── CMD07 DP4=0x00 received ────────────────────────────────►┘  (secondary)
      │
      │  wait_until feeding_active=false (max 30s)
      │
-     └── 30s timeout — no done signal received
+     └── 30s timeout — no done signal from MCU
            │
            ▼
-        [Error] → handshake reset
+        [Error]
+           │
+           ├── retries remaining? yes
+           │     → EN LOW → 2s → EN HIGH → do_handshake
+           │     → wait mcu_ready → retry feed ──────────────────► [Feeding]
+           │     (repeats up to Feed Max Retries times)
+           │
+           └── retries exhausted → last_error: "all retries exhausted, rebooting"
+                 → mcu_reboot: EN LOW → 2s → esp_restart()
+                 → device comes back online automatically
 ```
 
-`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block.
+`Idle` is set exclusively by the MCU. `Error` is set on timeout or cooldown block. Feed timeouts trigger an automatic MCU reset and retry cycle. If all retries fail the ESP restarts cleanly — the MCU gets a full EN LOW → HIGH reset and the device recovers without manual intervention.
 
 ---
 
@@ -415,13 +518,104 @@ MQTT connect
 
 The feed script checks two conditions before sending a feed command, in order:
 
-1. **Cooldown guard** — a 30-second cooldown is enforced between feeds. This prevents rapid re-triggers from HA automations and gives the MCU time to fully complete a feed cycle before the next one begins. If blocked, feeder status is set to `Error` and the script stops immediately.
+1. **Cooldown guard** — a 30-second cooldown is enforced between feeds. This prevents rapid re-triggers from HA automations and gives the MCU time to fully complete a feed cycle before the next one begins. If blocked, feeder status is set to `Error` and the script stops immediately. Cooldown is skipped on automatic retries (same feed cycle).
 
-2. **MCU ready guard** — waits up to 15 seconds for `mcu_ready` (DP4=0x00 received in startup dump). This prevents silent ignores on feeds triggered immediately after a power cycle before the motor controller has initialised. If the timeout expires without `mcu_ready`, feeder status is set to `Error` and the script stops.
+2. **MCU ready guard** — waits up to 15 seconds for `mcu_ready` (DP4=0x00 received in startup dump). This prevents silent ignores on feeds triggered immediately after a power cycle before the motor controller has initialised. If the timeout expires without `mcu_ready`, one automatic handshake retry is attempted before aborting.
 
 If either guard blocks, no feed frame is sent.
 
 Note: the physical lock button state is tracked for display purposes but has no effect on remote feeding — the lock only disables the physical buttons on the feeder body.
+
+---
+
+## Feed Retry and MCU Reset
+
+The MCU enters a degraded UART state after extended uptime where it receives the feed frame but does not respond. This appears as a 30-second feed timeout — the feeder shows `Error` and `last_error` shows `Feed timeout — no done signal from MCU`.
+
+When a timeout occurs the firmware automatically resets the MCU and retries the feed:
+
+```
+30s timeout
+  │
+  ├── retries remaining (default 3)?
+  │     │
+  │     ▼
+  │   last_error: "Feed timeout — retrying (N left)"
+  │   EN LOW → mcu_connected=false, mcu_ready=false
+  │   2s delay
+  │   EN HIGH → 1s delay → do_handshake
+  │   wait_until mcu_ready (up to 20s)
+  │   feed_script re-executes with same portions
+  │     │
+  │     ├── success → Idle ✓
+  │     └── timeout again → repeat until retries exhausted
+  │
+  └── retries exhausted
+        last_error: "Feed failed — all retries exhausted, rebooting"
+        500ms delay
+        mcu_reboot: EN LOW → 2s → esp_restart()
+          ↓
+        Device reboots, reconnects, MCU gets clean EN rising edge
+        availability: "restarting" → "offline" → "online"
+        User can retry feed manually after reconnect
+```
+
+The EN pin cycle (LOW → 2s → HIGH) forces the MCU to re-initialise its UART communication layer. A plain handshake without EN cycling is not sufficient to recover from this state.
+
+When all retries are exhausted the firmware performs a full ESP restart rather than leaving the device stuck. The MCU receives a proper 2s EN LOW period (no UART traffic during restart), giving it the same reset conditions as a power cycle. The device comes back online automatically without manual intervention.
+
+Each retry attempt uses the same portion count as the original command. Retries are transparent to HA — the feeder sensor stays on `Error` during the reset/retry cycle and returns to `Idle` on success.
+
+### Configuration
+
+| Entity | Default | Range | Description |
+|--------|---------|-------|-------------|
+| `Feed Max Retries` | 3 | 0–5 | Number of MCU reset+retry attempts before giving up. Set to `0` to disable retries. |
+
+Configure via MQTT: `wifi2mqtt/pet-feeder/number/feed_max_retries/command` → send `0`–`5`.
+
+---
+
+## Scheduled Daily Reboot
+
+The firmware supports an optional daily reboot at a configurable hour. This keeps the ESP32 fresh over long uptime (WiFi stack, memory) and gives the MCU a clean reset cycle.
+
+### Reboot sequence
+
+```
+on_time fires at configured hour (:00)
+  Auto Reboot switch ON?
+    │
+    ▼
+  availability → "restarting"   ← distinguishes from crash in MQTT logs
+  EN LOW
+  mcu_connected = false, mcu_ready = false
+  2s delay                      ← MCU UART state fully resets
+  ESP.restart()
+    │
+    ▼
+  on_boot: EN stays LOW, first_connect_done = false
+  WiFi + MQTT reconnect (~5s)
+  on_connect: hold EN LOW until 10s from boot → EN HIGH → do_handshake
+  Normal operation resumes ✓  (~12–15s from restart)
+```
+
+The `mcu_reboot` script is shared by the scheduled reboot, the feed-retry exhausted path, and any future hard-reset needs. The EN LOW → 2s hold ensures the MCU fully resets its UART state before the ESP comes back up. `first_connect_done` is reset on every ESP restart so the 10s boot delay always applies on the first reconnect after a reboot — whether scheduled, OTA-triggered, or from a feed failure.
+
+After the reboot, `availability` transitions `restarting` → `offline` → `online`. A crash or unexpected brownout reboot shows only `offline` → `online` with no `restarting` prefix, which can be used to distinguish the two in HA automations.
+
+### Configuration
+
+| Entity | Default | Description |
+|--------|---------|-------------|
+| `Auto Reboot` switch | ON | Enable or disable the daily reboot entirely |
+| `Reboot Hour` number | `3` (03:00) | Local hour to reboot. Set well clear of scheduled feed times |
+
+Configure via MQTT:
+- `wifi2mqtt/pet-feeder/switch/auto-reboot/command` → `ON` / `OFF`
+- `wifi2mqtt/pet-feeder/number/reboot-hour/command` → `0`–`23`
+
+Both settings are persisted in flash — survive reboots without reflashing.
 
 ---
 
@@ -439,6 +633,12 @@ After a full power cycle, the MCU responds to the handshake (CMD01) quickly but 
 
 The physical lock button only disables the buttons on the feeder body. UART feed commands are accepted regardless of lock state — the lock does not block remote feeding.
 
+### MCU UART state degradation after extended uptime
+
+After extended uptime (observed at 1–3 days) the MCU enters a state where it receives UART feed commands but does not respond to them — no DP3 echo, no DP4 motor state change, no CMD34. The feed times out after 30 seconds. A plain handshake retry without toggling the EN pin does not recover the MCU from this state.
+
+The firmware handles this automatically via the feed retry mechanism: on timeout, the EN pin is cycled LOW → 2s → HIGH, which forces the MCU to re-initialise its UART communication layer. The feed is then retried with the same portion count. See [Feed Retry and MCU Reset](#feed-retry-and-mcu-reset).
+
 ### CMD 0x1C payload length — stream corruption bug (fixed)
 
 The MCU sends a time sync request every second. The correct response payload is **8 bytes**, as confirmed by WBR3 logic analyser captures. An earlier version of this firmware declared `len=8` in the frame header but only wrote 6 bytes of payload, producing a 13-byte frame where the MCU expected 15. On every time sync response the MCU consumed 2 bytes from the next UART frame as part of the CMD 0x1C payload, continuously desynchronising the stream.
@@ -451,9 +651,36 @@ The fix sends all 8 payload bytes: `[4B UTC unix timestamp] [local hour] [local 
 
 ## Debugging
 
-### MQTT log 
-https://esphome.io/components/logger/ 
-The logger component automatically logs all log messages through the serial port and through MQTT topics (if there is an MQTT client in the configuration). By default, all logs with a severity DEBUG or higher will be shown. Increasing the log level severity (to e.g INFO or WARN ) can help with the performance of the application and memory size.
+### Last error topic
+
+Whenever the feeder status goes to `Error`, the reason and a local timestamp are published to:
+```
+wifi2mqtt/pet-feeder/last_error
+```
+
+The message is **retained** — the broker holds the last value indefinitely. You can query it any time, including after an ESP reboot, to see what went wrong most recently.
+
+| Message | Cause |
+|---------|-------|
+| `[HH:MM:SS] Feed blocked — Xs cooldown remaining` | A feed was triggered within 30 seconds of the previous one |
+| `[HH:MM:SS] MCU not ready — motor not initialised after 15s` | Motor controller never signalled ready (DP4=0) after startup |
+| `[HH:MM:SS] MCU not ready — motor not initialised after retry` | Second wait for mcu_ready also timed out |
+| `[HH:MM:SS] Feed timeout — retrying (N left)` | MCU did not respond — EN pin reset in progress, N more attempts remaining |
+| `[HH:MM:SS] Feed failed — all retries exhausted, rebooting` | MCU failed to respond after all retry attempts — ESP restart initiated |
+
+If SNTP hasn't synced yet when the error occurs, the timestamp prefix is omitted and the message is written without brackets.
+
+### MQTT log mirror
+
+ESPHome's `logger` component can mirror the serial log to an MQTT topic automatically — no custom code required. Add `mqtt_topic:` to the `logger:` block:
+
+```yaml
+logger:
+  level: DEBUG
+  mqtt_topic: wifi2mqtt/pet-feeder/debug
+```
+
+Whatever passes the configured `level` filter appears on both serial and MQTT. Remove `mqtt_topic:` (or set it to an empty string) to disable. See the [ESPHome logger docs](https://esphome.io/components/logger/) for details.
 
 ### Serial log verbosity
 
@@ -491,6 +718,8 @@ Pick one. What each level shows:
 
 ### Common error states
 
+When the feeder status shows `Error`, check `wifi2mqtt/pet-feeder/last_error` first — it contains the timestamped reason for the most recent error, retained at the broker.
+
 **Feeder stuck on "Feeding" / feed button does nothing after one use:**
 The `feed_script` runs in `mode: single`. If the script timed out, a reboot will reset the state.
 
@@ -515,7 +744,6 @@ At the top of `pet-feeder.yaml`:
 substitutions:
   device_name: pet-feeder
   topic_prefix: wifi2mqtt/pet-feeder
-  mqtt_debug: ""   # set to "wifi2mqtt/pet-feeder/debug" to mirror serial log to MQTT
 ```
 
 Secrets required in `secrets.yaml`:

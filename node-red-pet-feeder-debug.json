@@ -1,0 +1,189 @@
+[
+  {
+    "id": "pf_tab",
+    "type": "tab",
+    "label": "Pet Feeder Debug",
+    "disabled": false,
+    "info": "Pet feeder MQTT debug flow.\nSet your MQTT broker on all mqtt-in nodes before deploying."
+  },
+
+  {
+    "id": "pf_mqtt_all",
+    "type": "mqtt in",
+    "z": "pf_tab",
+    "name": "All Topics",
+    "topic": "wifi2mqtt/pet-feeder/#",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "",
+    "rap": true,
+    "x": 120, "y": 80,
+    "wires": [["pf_fmt_log", "pf_fn_latest"]]
+  },
+
+  {
+    "id": "pf_fmt_log",
+    "type": "function",
+    "z": "pf_tab",
+    "name": "Format log line",
+    "func": "const prefix = 'wifi2mqtt/pet-feeder/';\nconst key = msg.topic.replace(prefix, '');\nconst ts = new Date().toLocaleTimeString('sv-SE');\nmsg.payload = `[${ts}] ${key.padEnd(14)} ${msg.payload}`;\nreturn msg;",
+    "outputs": 1,
+    "x": 340, "y": 80,
+    "wires": [["pf_dbg_all", "pf_file_log"]]
+  },
+
+  {
+    "id": "pf_file_log",
+    "type": "file",
+    "z": "pf_tab",
+    "name": "Append to log file",
+    "filename": "/config/logs/pet-feeder.log",
+    "filenameType": "str",
+    "appendNewline": true,
+    "createDir": true,
+    "overwriteFile": "false",
+    "encoding": "utf8",
+    "x": 560, "y": 120,
+    "wires": []
+  },
+  {
+    "id": "pf_dbg_all",
+    "type": "debug",
+    "z": "pf_tab",
+    "name": "All messages",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 560, "y": 80,
+    "wires": []
+  },
+
+  {
+    "id": "pf_fn_latest",
+    "type": "function",
+    "z": "pf_tab",
+    "name": "Latest state",
+    "func": "const prefix = 'wifi2mqtt/pet-feeder/';\nconst key = msg.topic.replace(prefix, '');\nlet state = flow.get('pf_state') || {};\nstate[key] = msg.payload;\nflow.set('pf_state', state);\n\nconst order = ['availability','feeder','mcu','lock','last_error','rssi','ip'];\nlet lines = ['--- Pet Feeder State ---'];\nfor (const k of order) {\n  if (state[k] !== undefined)\n    lines.push(`  ${k.padEnd(14)}: ${state[k]}`);\n}\nfor (const k of Object.keys(state)) {\n  if (!order.includes(k))\n    lines.push(`  ${k.padEnd(14)}: ${state[k]}`);\n}\nlines.push('------------------------');\nmsg.payload = lines.join('\\n');\nreturn msg;",
+    "outputs": 1,
+    "x": 340, "y": 180,
+    "wires": [["pf_dbg_latest"]]
+  },
+  {
+    "id": "pf_dbg_latest",
+    "type": "debug",
+    "z": "pf_tab",
+    "name": "Latest state",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 560, "y": 180,
+    "wires": []
+  },
+
+  {
+    "id": "pf_inject_state",
+    "type": "inject",
+    "z": "pf_tab",
+    "name": "Dump latest state",
+    "props": [{"p": "payload"}],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "payload": "",
+    "payloadType": "str",
+    "x": 130, "y": 260,
+    "wires": [["pf_fn_dump"]]
+  },
+  {
+    "id": "pf_fn_dump",
+    "type": "function",
+    "z": "pf_tab",
+    "name": "Read state",
+    "func": "const state = flow.get('pf_state') || {};\nconst order = ['availability','feeder','mcu','lock','last_error','rssi','ip'];\nlet lines = ['--- Pet Feeder State (on demand) ---'];\nfor (const k of order) {\n  if (state[k] !== undefined)\n    lines.push(`  ${k.padEnd(14)}: ${state[k]}`);\n}\nfor (const k of Object.keys(state)) {\n  if (!order.includes(k))\n    lines.push(`  ${k.padEnd(14)}: ${state[k]}`);\n}\nif (Object.keys(state).length === 0)\n  lines.push('  (no data yet)');\nlines.push('------------------------------------');\nmsg.payload = lines.join('\\n');\nreturn msg;",
+    "outputs": 1,
+    "x": 340, "y": 260,
+    "wires": [["pf_dbg_latest"]]
+  },
+
+  {
+    "id": "pf_mqtt_error",
+    "type": "mqtt in",
+    "z": "pf_tab",
+    "name": "last_error",
+    "topic": "wifi2mqtt/pet-feeder/last_error",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "",
+    "rap": true,
+    "x": 120, "y": 360,
+    "wires": [["pf_fmt_error"]]
+  },
+  {
+    "id": "pf_fmt_error",
+    "type": "function",
+    "z": "pf_tab",
+    "name": "Format error",
+    "func": "const ts = new Date().toLocaleTimeString('sv-SE');\nmsg.payload = `[${ts}] LAST ERROR: ${msg.payload}`;\nreturn msg;",
+    "outputs": 1,
+    "x": 340, "y": 360,
+    "wires": [["pf_dbg_error"]]
+  },
+  {
+    "id": "pf_dbg_error",
+    "type": "debug",
+    "z": "pf_tab",
+    "name": "Last error",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 560, "y": 360,
+    "wires": []
+  },
+
+  {
+    "id": "pf_mqtt_avail",
+    "type": "mqtt in",
+    "z": "pf_tab",
+    "name": "availability",
+    "topic": "wifi2mqtt/pet-feeder/availability",
+    "qos": "1",
+    "datatype": "auto-detect",
+    "broker": "",
+    "rap": true,
+    "x": 120, "y": 440,
+    "wires": [["pf_fmt_avail"]]
+  },
+  {
+    "id": "pf_fmt_avail",
+    "type": "function",
+    "z": "pf_tab",
+    "name": "Format availability",
+    "func": "const ts = new Date().toLocaleTimeString('sv-SE');\nconst status = {\n  online:     'ONLINE',\n  offline:    'OFFLINE',\n  restarting: 'RESTARTING (scheduled)'\n};\nmsg.payload = `[${ts}] ${status[msg.payload] || msg.payload}`;\nreturn msg;",
+    "outputs": 1,
+    "x": 340, "y": 440,
+    "wires": [["pf_dbg_avail"]]
+  },
+  {
+    "id": "pf_dbg_avail",
+    "type": "debug",
+    "z": "pf_tab",
+    "name": "Availability",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 560, "y": 440,
+    "wires": []
+  }
+]
