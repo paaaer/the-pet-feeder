@@ -49,7 +49,7 @@ If MQTT takes longer than 10 seconds to connect (slow WiFi), the wait resolves t
 
 **Subsequent MQTT reconnects** — `first_connect_done` is set after the first EN rise and persists until the next ESP restart. On reconnects the delay is skipped and EN rises immediately — the MCU is already running and responds quickly.
 
-**Boot watchdog** — If the MCU still has not responded with CMD01 after 60 seconds of handshake retries (e.g. very slow boot or missed edge), the firmware pulses EN LOW → 2s → HIGH to give the MCU a fresh rising edge. This repeats every 60 seconds until CMD01 arrives.
+**Boot watchdog** — The firmware retries the handshake every 5 seconds. If the MCU has still not answered with CMD01 after 3 attempts (15 seconds), the watchdog (`en_repulse`) drives EN LOW for **5 seconds** and then HIGH again, to give the MCU a fresh rising edge, and restarts the handshake. `handshake_attempts` is reset by each re-pulse, so this repeats about every 18 seconds until CMD01 arrives. Each re-pulse is logged as `re-pulse #N` (`repulse_count`, cleared when the MCU connects). A 5 s low is used because repeated 2 s pulses did not recover an MCU that was stuck after a power cycle in tests, while a single 5 s low did.
 
 ---
 
@@ -131,7 +131,7 @@ MCU sends startup DP dump → DP4=0x00 arrives
 Ready for feeds ✓  (~12–15s from boot)
 ```
 
-If CMD01 never arrives (e.g. very slow MCU boot), the 5s handshake interval keeps retrying. After 60s of no response the boot watchdog pulses EN LOW → 2s → HIGH and resets the retry counter, repeating every 60s until the MCU responds.
+If CMD01 never arrives (e.g. very slow MCU boot), the 5s handshake interval keeps retrying. After 3 attempts (15s) with no response the boot watchdog holds EN LOW for 5s, then HIGH, and resets the retry counter, repeating about every 18s until the MCU responds.
 
 **Scenario 2 — ESP-only reboot (OTA flash, crash, scheduled reboot):**
 
