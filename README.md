@@ -49,7 +49,7 @@ If MQTT takes longer than 10 seconds to connect (slow WiFi), the wait resolves t
 
 **Subsequent MQTT reconnects** — `first_connect_done` is set after the first EN rise and persists until the next ESP restart. On reconnects the delay is skipped and EN rises immediately — the MCU is already running and responds quickly.
 
-**Boot watchdog** — The firmware retries the handshake every 5 seconds. If the MCU has still not answered with CMD01 after 3 attempts (15 seconds), the watchdog (`en_repulse`) drives EN LOW for **5 seconds** and then HIGH again, to give the MCU a fresh rising edge, and restarts the handshake. `handshake_attempts` is reset by each re-pulse, so this repeats about every 18 seconds until CMD01 arrives. Each re-pulse is logged as `re-pulse #N` (`repulse_count`, cleared when the MCU connects). A 5 s low is used because repeated 2 s pulses did not recover an MCU that was stuck after a power cycle in tests, while a single 5 s low did.
+**Boot watchdog** — The firmware retries the handshake every 5 seconds. If the MCU has still not answered with CMD01 after 3 attempts (15 seconds), the watchdog (`en_repulse`) drives EN LOW for **5 seconds** and then HIGH again, to give the MCU a fresh rising edge, and restarts the handshake. `handshake_attempts` is reset by each re-pulse, so this repeats about every 18 seconds until CMD01 arrives. Each re-pulse is logged as `re-pulse #N` (`repulse_count`, cleared when the MCU connects). The 5 s low is a precaution. A test that seemed to show it recovers a stuck MCU turned out to be a status publishing bug instead (see [`MCU Status` shows `Disconnected` although the MCU is connected (fixed)](#mcu-status-shows-disconnected-although-the-mcu-is-connected-fixed)); a really unresponsive MCU has not been reproduced.
 
 ---
 
@@ -639,28 +639,24 @@ After extended uptime (observed at 1–3 days) the MCU enters a state where it r
 
 The firmware handles this automatically via the feed retry mechanism: on timeout, the EN pin is cycled LOW → 2s → HIGH, which forces the MCU to re-initialise its UART communication layer. The feed is then retried with the same portion count. See [Feed Retry and MCU Reset](#feed-retry-and-mcu-reset).
 
-### MCU stuck in `Disconnected` after a power cycle
+### `MCU Status` shows `Disconnected` although the MCU is connected (fixed)
 
-**Symptom.** After the feeder's power is cut for a few seconds and restored, the ESP32 comes back online (WiFi, MQTT, RSSI all fine) but the MCU never reaches `Connected`. `MCU Status` stays `Disconnected`, and `Feeder Status` shows the default `Idle`, which is only a placeholder published on every MQTT connect, not a real MCU state. Feeds fail until the MCU is recovered.
+**Symptom.** After the feeder's power is cut for a few seconds and restored, Home Assistant sometimes showed `MCU Status = Disconnected` for as long as the feeder ran, while WiFi, MQTT and RSSI were fine. `Feeder Status` showed `Idle`, which is only a placeholder published on every MQTT connect. About one power cycle in four showed it in testing (6 s power cuts through a smart plug).
 
-**How often.** Observed on a real feeder with 6 s power cuts through a smart plug. When the start is good, the MCU is `Connected` 8–11 s after power on. In one test session about one cycle in four got stuck.
+**Cause.** The MCU was not stuck. The firmware's own view, published by a temporary diagnostic line during such a state, was:
 
-**Test (2026-11-08).** The MCU was put in the stuck state by power cycling the plug (6 s off) until it had not reached `Connected` within 30 s. Then an EN command was sent through a temporary MQTT test hook (`enCmd`, not part of the firmware), or nothing was done:
+```
+HA sensor:  Disconnected   (unchanged after 70 s)
+firmware:   connected=1 ready=1 heartbeat=1 attempts=0 repulses=0 feeding=0
+```
 
-| Action while stuck | Result |
-|---|---|
-| EN low 5 s (`low:5000`) | `Connected` after 24 s |
-| EN low 15 s (`low:15000`) | `Connected` after 25 s |
-| 3 pulses, 500 ms low, 1 s gap | `Connected` 15 s after the command |
-| 3 pulses, 2 s low, 1 s gap | `Connected` after 19 s |
-| Nothing (control; watchdog with 15 s trigger and 2 s low pulse), 3 runs | Not recovered within 90 s, 3 of 3 |
+`on_connect` published a fixed `Disconnected` on every MQTT connection, and the status was only republished on events. When the MCU had already connected before MQTT came up, or the `Connected` publish came first, the stale `Disconnected` was the last value Home Assistant saw. The exact event order was not captured because the MQTT log mirror drops lines.
 
-The times match the length of the EN sequence plus the normal 10 s the MCU needs to connect, so the EN command, not waiting, recovered it. With the same firmware, the watchdog's repeated 2 s re-pulses did not recover the MCU in any control run. Why a single 2 s low fails while a single 5 s low works is not known, and neither is the shortest low time that works. The sample is small.
+**Fix.** `on_connect` publishes the state from `mcu_connected` / `mcu_ready`, and a 10 s interval republishes it, so a stale value corrects itself within 10 s. With this firmware, 10 power cuts in a row never left the sensor in the wrong state (twice it showed `Disconnected` for 4–5 s and corrected itself).
 
-**Solutions.**
+**What the earlier EN tests really showed.** Before the cause was found, a test with an EN command sent while the sensor showed `Disconnected` made it `Connected` again within 15–25 s (EN low 5 s, EN low 15 s, 3 pulses of 500 ms, 3 pulses of 2 s), while the boot watchdog's repeated 2 s re-pulses did not within 90 s (3 control runs). The EN commands reset the flags and published `Connected` again; they did not recover a stuck MCU, because the MCU was not stuck. Whether the 5 s EN low in the boot watchdog (`en_repulse`) is needed for a really unresponsive MCU has not been tested.
 
-1. **Firmware:** the boot watchdog holds EN low for 5 s instead of 2 s and fires after 15 s instead of 60 s (see the pull request that changes `en_repulse`).
-2. **Home Assistant, as a fallback:** cycle the plug up to 5 times. Cut power for 6 s, wait 25 s for `MCU Status` to become `Connected` *after* the power came back (compare `last_changed` with the time of power on, because a stale retained `Connected` would otherwise give a false positive), and try again. After 5 failures, notify and stop. A restart that reaches `Connected` on the second try took about 90 s in testing.
+**Consequence for a Home Assistant restart script.** `Connected` can now stay unchanged during the whole power cycle, so a script must not wait for a new `last_changed`. Wait about 20 s after power on, then require `Connected` (and not `unavailable`, which means the feeder is not on MQTT).
 
 ### CMD 0x1C payload length — stream corruption bug (fixed)
 
