@@ -383,7 +383,7 @@ script:
     then:
       - logger.log:
           level: WARN
-          format: "MCU not responding after 15s — re-pulsing EN for fresh rising edge (re-pulse #%d)"
+          format: "MCU not responding after 15s — holding EN low 5s for fresh rising edge (re-pulse #%d)"
           args: ['id(repulse_count) + 1']
       - output.turn_off: mcu_en_pin
       - lambda: |-
@@ -391,7 +391,7 @@ script:
           id(mcu_connected) = false;
           id(mcu_ready) = false;
           id(handshake_attempts) = 0;
-      - delay: 2s
+      - delay: 5s   # EN low for 5 s: 2 s pulses did not recover a stuck MCU in tests, 5 s did
       - output.turn_on: mcu_en_pin
       - delay: 1s
       - script.execute: do_handshake
