@@ -432,7 +432,7 @@ All topics are under the prefix `wifi2mqtt/pet-feeder/`.
 | `feeder` | yes | `Idle` / `Feeding` / `Error` | Feeder motor state. Set by MCU responses — never by a timer |
 | `mcu` | yes | `Disconnected` / `Initialising` / `Connected` | MCU handshake state. `Initialising` = CMD01 received, waiting for motor controller ready |
 | `lock` | yes | `Locked` / `Unlocked` | Physical lock button on feeder body. Display only — does not affect remote feeding |
-| `last_error` | yes | timestamped string | Last error reason — retained, persists across reboots. See [Last error topic](#last-error-topic) |
+| `last_error` | yes | string with date and time | Last error reason — retained, persists across reboots. See [Last error topic](#last-error-topic) |
 | `rssi` | yes | dBm integer | WiFi signal strength, updated every 60s |
 | `ip` | no | IP address string | Device IP address, updated on change |
 | `debug` | no | text | Serial log mirror — published when `logger: mqtt_topic:` is configured |
@@ -662,11 +662,11 @@ The message is **retained** — the broker holds the last value indefinitely. Yo
 
 | Message | Cause |
 |---------|-------|
-| `[HH:MM:SS] Feed blocked — Xs cooldown remaining` | A feed was triggered within 30 seconds of the previous one |
-| `[HH:MM:SS] MCU not ready — motor not initialised after 15s` | Motor controller never signalled ready (DP4=0) after startup |
-| `[HH:MM:SS] MCU not ready — motor not initialised after retry` | Second wait for mcu_ready also timed out |
-| `[HH:MM:SS] Feed timeout — retrying (N left)` | MCU did not respond — EN pin reset in progress, N more attempts remaining |
-| `[HH:MM:SS] Feed failed — all retries exhausted, rebooting` | MCU failed to respond after all retry attempts — ESP restart initiated |
+| `[YYYY-MM-DD HH:MM:SS] Feed blocked — Xs cooldown remaining` | A feed was triggered within 30 seconds of the previous one |
+| `[YYYY-MM-DD HH:MM:SS] MCU not ready — motor not initialised after 15s` | Motor controller never signalled ready (DP4=0) after startup |
+| `[YYYY-MM-DD HH:MM:SS] MCU not ready — motor not initialised after retry` | Second wait for mcu_ready also timed out |
+| `[YYYY-MM-DD HH:MM:SS] Feed timeout — retrying (N left)` | MCU did not respond — EN pin reset in progress, N more attempts remaining |
+| `[YYYY-MM-DD HH:MM:SS] Feed failed — all retries exhausted, rebooting` | MCU failed to respond after all retry attempts — ESP restart initiated |
 
 If SNTP hasn't synced yet when the error occurs, the timestamp prefix is omitted and the message is written without brackets.
 
