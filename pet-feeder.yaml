@@ -94,7 +94,10 @@ mqtt:
           payload: "online"
           retain: true
       - lambda: id(feeder_sensor).publish_state("Idle");
-      - lambda: id(mcu_sensor).publish_state("Disconnected");
+      # Publish the real state, not a fixed "Disconnected": the MCU can already be connected
+      # (CMD01 received) before MQTT is up, and a fixed value would hide that from Home Assistant.
+      - lambda: |-
+          id(mcu_sensor).publish_state(id(mcu_connected) && id(mcu_ready) ? "Connected" : "Disconnected");
       - lambda: id(lock_sensor).publish_state("Unlocked");
       # On first boot hold EN LOW until 10s from power-on.
       # ESP connects WiFi+MQTT in ~5s; MCU needs ~10s to finish booting.
@@ -622,6 +625,18 @@ script:
                   - script.execute: mcu_reboot
 
 interval:
+  # Keep the MCU Status sensor in sync with the real state. A stale "Disconnected" (for example
+  # published by on_connect after the MCU had already connected) corrects itself within 10 s.
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (id(mcu_connected) && id(mcu_ready))
+            id(mcu_sensor).publish_state("Connected");
+          else if (id(mcu_connected))
+            id(mcu_sensor).publish_state("Initialising");
+          else
+            id(mcu_sensor).publish_state("Disconnected");
+
   - interval: 30s
     then:
       - mqtt.publish:
