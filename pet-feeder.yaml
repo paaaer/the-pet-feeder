@@ -488,10 +488,10 @@ script:
                 payload: !lambda |-
                   auto t = id(sntp_time).now();
                   uint32_t remaining = 30000 - (millis() - id(last_feed_millis));
-                  char msg[80];
+                  char msg[100];
                   if (t.is_valid())
-                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed blocked — %us cooldown remaining",
-                             t.hour, t.minute, t.second, remaining / 1000);
+                    snprintf(msg, sizeof(msg), "[%04d-%02d-%02d %02d:%02d:%02d] Feed blocked — %us cooldown remaining",
+                             t.year, t.month, t.day_of_month, t.hour, t.minute, t.second, remaining / 1000);
                   else
                     snprintf(msg, sizeof(msg), "Feed blocked — %us cooldown remaining", remaining / 1000);
                   return std::string(msg);
@@ -532,10 +532,10 @@ script:
                 topic: ${topic_prefix}/last_error
                 payload: !lambda |-
                   auto t = id(sntp_time).now();
-                  char msg[80];
+                  char msg[100];
                   if (t.is_valid())
-                    snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] MCU not ready — motor not initialised after retry",
-                             t.hour, t.minute, t.second);
+                    snprintf(msg, sizeof(msg), "[%04d-%02d-%02d %02d:%02d:%02d] MCU not ready — motor not initialised after retry",
+                             t.year, t.month, t.day_of_month, t.hour, t.minute, t.second);
                   else
                     snprintf(msg, sizeof(msg), "MCU not ready — motor not initialised after retry");
                   return std::string(msg);
@@ -595,10 +595,10 @@ script:
                       topic: ${topic_prefix}/last_error
                       payload: !lambda |-
                         auto t = id(sntp_time).now();
-                        char msg[80];
+                        char msg[100];
                         if (t.is_valid())
-                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed timeout — retrying (%d left)",
-                                   t.hour, t.minute, t.second, id(feed_retry_remaining));
+                          snprintf(msg, sizeof(msg), "[%04d-%02d-%02d %02d:%02d:%02d] Feed timeout — retrying (%d left)",
+                                   t.year, t.month, t.day_of_month, t.hour, t.minute, t.second, id(feed_retry_remaining));
                         else
                           snprintf(msg, sizeof(msg), "Feed timeout — retrying (%d left)",
                                    id(feed_retry_remaining));
@@ -611,10 +611,10 @@ script:
                       topic: ${topic_prefix}/last_error
                       payload: !lambda |-
                         auto t = id(sntp_time).now();
-                        char msg[80];
+                        char msg[100];
                         if (t.is_valid())
-                          snprintf(msg, sizeof(msg), "[%02d:%02d:%02d] Feed failed — all retries exhausted, rebooting",
-                                   t.hour, t.minute, t.second);
+                          snprintf(msg, sizeof(msg), "[%04d-%02d-%02d %02d:%02d:%02d] Feed failed — all retries exhausted, rebooting",
+                                   t.year, t.month, t.day_of_month, t.hour, t.minute, t.second);
                         else
                           snprintf(msg, sizeof(msg), "Feed failed — all retries exhausted, rebooting");
                         return std::string(msg);
