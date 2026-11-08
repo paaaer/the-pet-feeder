@@ -639,6 +639,29 @@ After extended uptime (observed at 1–3 days) the MCU enters a state where it r
 
 The firmware handles this automatically via the feed retry mechanism: on timeout, the EN pin is cycled LOW → 2s → HIGH, which forces the MCU to re-initialise its UART communication layer. The feed is then retried with the same portion count. See [Feed Retry and MCU Reset](#feed-retry-and-mcu-reset).
 
+### MCU stuck in `Disconnected` after a power cycle
+
+**Symptom.** After the feeder's power is cut for a few seconds and restored, the ESP32 comes back online (WiFi, MQTT, RSSI all fine) but the MCU never reaches `Connected`. `MCU Status` stays `Disconnected`, and `Feeder Status` shows the default `Idle`, which is only a placeholder published on every MQTT connect, not a real MCU state. Feeds fail until the MCU is recovered.
+
+**How often.** Observed on a real feeder with 6 s power cuts through a smart plug. When the start is good, the MCU is `Connected` 8–11 s after power on. In one test session about one cycle in four got stuck.
+
+**Test (2026-11-08).** The MCU was put in the stuck state by power cycling the plug (6 s off) until it had not reached `Connected` within 30 s. Then an EN command was sent through a temporary MQTT test hook (`enCmd`, not part of the firmware), or nothing was done:
+
+| Action while stuck | Result |
+|---|---|
+| EN low 5 s (`low:5000`) | `Connected` after 24 s |
+| EN low 15 s (`low:15000`) | `Connected` after 25 s |
+| 3 pulses, 500 ms low, 1 s gap | `Connected` 15 s after the command |
+| 3 pulses, 2 s low, 1 s gap | `Connected` after 19 s |
+| Nothing (control; watchdog with 15 s trigger and 2 s low pulse), 3 runs | Not recovered within 90 s, 3 of 3 |
+
+The times match the length of the EN sequence plus the normal 10 s the MCU needs to connect, so the EN command, not waiting, recovered it. With the same firmware, the watchdog's repeated 2 s re-pulses did not recover the MCU in any control run. Why a single 2 s low fails while a single 5 s low works is not known, and neither is the shortest low time that works. The sample is small.
+
+**Solutions.**
+
+1. **Firmware:** the boot watchdog holds EN low for 5 s instead of 2 s and fires after 15 s instead of 60 s (see the pull request that changes `en_repulse`).
+2. **Home Assistant, as a fallback:** cycle the plug up to 5 times. Cut power for 6 s, wait 25 s for `MCU Status` to become `Connected` *after* the power came back (compare `last_changed` with the time of power on, because a stale retained `Connected` would otherwise give a false positive), and try again. After 5 failures, notify and stop. A restart that reaches `Connected` on the second try took about 90 s in testing.
+
 ### CMD 0x1C payload length — stream corruption bug (fixed)
 
 The MCU sends a time sync request every second. The correct response payload is **8 bytes**, as confirmed by WBR3 logic analyser captures. An earlier version of this firmware declared `len=8` in the frame header but only wrote 6 bytes of payload, producing a 13-byte frame where the MCU expected 15. On every time sync response the MCU consumed 2 bytes from the next UART frame as part of the CMD 0x1C payload, continuously desynchronising the stream.
